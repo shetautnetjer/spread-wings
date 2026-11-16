@@ -32,3 +32,15 @@ bool sw_realpath(sw_slice path, gs_rref out) {
     gs_bld_append(out, res, strlen(res));
     return true;
 }
+
+/* mkdir -p, for the decision cache. */
+#include <errno.h>
+#include <sys/types.h>
+bool sw_mkdirs(sw_slice path) {
+    char buf[4096];
+    if (!to_cstr(path, buf, sizeof buf)) return false;
+    for (char *p = buf + 1; *p; p++) {
+        if (*p == '/') { *p = 0; if (mkdir(buf, 0700) != 0 && errno != EEXIST) return false; *p = '/'; }
+    }
+    return mkdir(buf, 0700) == 0 || errno == EEXIST;
+}

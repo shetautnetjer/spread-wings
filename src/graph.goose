@@ -250,6 +250,14 @@ fn link_calls(db: i64) {
                    1.0 / COUNT(*) OVER (PARTITION BY ch.cid), 1, ch.resolution
             FROM chosen ch JOIN calls c ON c.rowid = ch.cid;
 
+        DROP TABLE defs; DROP TABLE ndefs; DROP TABLE cands; DROP TABLE chosen; DROP TABLE done;
+    """);
+    call_file_edges(db);
+}
+
+// File links from call links.
+fn call_file_edges(db: i64) {
+    sqlite::exec_or_die(db, """
         -- File links from calls count for less than an import: weight 0.3,
         -- and by_name links only for names defined in at most 3 files, so
         -- generic names (`new`, `parse`) don't tie unrelated files together.
@@ -258,9 +266,8 @@ fn link_calls(db: i64) {
             FROM call_edges e JOIN symbols s ON s.id = e.callee
             WHERE s.file_id != e.file_id
               AND (e.resolution != 'by_name'
-                   OR (SELECT COUNT(DISTINCT d.sfile) FROM defs d WHERE d.name = s.name) <= 3)
+                   OR (SELECT COUNT(DISTINCT d.file_id) FROM symbols d WHERE d.name = s.name AND d.kind IN ('function', 'class', 'struct', 'enum', 'trait', 'interface')) <= 3)
             GROUP BY e.file_id, s.file_id;
-        DROP TABLE defs; DROP TABLE ndefs; DROP TABLE cands; DROP TABLE chosen; DROP TABLE done;
     """);
 }
 
@@ -334,7 +341,7 @@ fn load_csr(db: i64, table: const u8[:], n: i64, off: i64[>..]&, nbr: i64[>..]&,
         let a = sqlite::col_int(st, 0);
         row_a.push(a);
         nbr.push(sqlite::col_int(st, 1));
-        w.push(sqlite::col_int(st, 2) as f64 / 1000.0);
+        w.push(sqlite::col_int(st, 2) / 1000.0);
     }
     sqlite::finalize(st);
     for a in row_a { off[a + 1] = off[a + 1] + 1; }

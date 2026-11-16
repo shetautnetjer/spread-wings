@@ -1,4 +1,6 @@
-// Spread-Wings' one native helper (lstat for the walk); SQLite and
-// tree-sitter come from the goose-sqlite and goose-treesitter packages.
-c_sources = ["../native/sw_sys.c"];
+// Spread-Wings' native helpers: lstat/realpath for the walk, and an HTTPS
+// POST (libcurl) for the decision step. SQLite and tree-sitter come from the
+// goose-sqlite and goose-treesitter packages.
+c_sources = ["../native/sw_sys.c", "../native/sw_http.c"];
+c_libs = ["curl", "pthread"];
 output = "spread-wings";

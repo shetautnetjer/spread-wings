@@ -78,7 +78,55 @@ Every fact is one of:
 Tools say which. Nothing is compiler-resolved, and in 0.1 nothing comes from
 a model.
 
-## 0.2: decisions with Span-02
+## Decisions with Span-02 (built)
+
+`spread-wings decide <graph.db> [--max N]` asks
+[Span-02](https://www.respan.ai/models/span-02) (`respan/span-02`, through
+OpenRouter's System One endpoint, `/api/v1/systemone`) about every call
+still `by_name` after the import rules: a typed **choice** among the
+candidate definitions plus **outside** ("a library, a builtin or another
+type"), with a probability per option.
+
+- **State per function, questions per call.** The model bills the state
+  once *per question* (measured: 1, 10 and 100 questions on one state cost
+  1x, 10x and 100x the tokens), while a request with 100 questions takes
+  about as long as one with 1 (1.1 s). So the state is only the caller's own
+  function (at most 120 lines), and all of that function's ambiguous calls
+  go in one request (at most 50 questions).
+- **Parallel.** Requests run on worker threads (16), retrying 429 and 5xx
+  with backoff. The HTTP call is a small libcurl helper that reads the key
+  from the environment by name, so the key never enters the graph or logs.
+- **Cached by content** (model + state + question) in
+  `~/.cache/spread-wings/decisions.db`: an unchanged function is never asked
+  again.
+- **Applied conservatively.** A definition chosen with p >= 0.6 becomes the
+  call's only link (`resolution = decided`, weight p). "Outside" with
+  p >= 0.6 removes the guessed links. Anything less certain stays `by_name`.
+  File links and communities are then recomputed.
+
+Measured on Graphify's repo (`52cb282`): 13,712 questions in 5,122
+requests, none failed, **$0.157** in total, 206 s of waiting on the network.
+
+- 11,980 calls were **outside** the repo: `dict.get`, `set()`, `set.add`,
+  `Path.resolve`, `mock.patch`, networkx's `G.edges`. Each had been linked
+  by name to a same-named repo method (httpx's `Client.get`, `Cookies.set`),
+  so these were false edges, now removed.
+- 1,631 calls were tied to **one repo definition**, mostly calls through
+  module aliases (`llm.extract_files_direct`, `sc.sanitize_semantic_fragment`,
+  `mainmod.main`, where `main` is defined 73 times). All 14 sampled were
+  right.
+- 101 stayed `by_name` (p < 0.6).
+- One sampled mistake: a name imported from a module that only re-exports
+  it (`from graphify.extract import _make_id`, defined in
+  `extractors/base.py`) was called "outside" at p = 0.64. Following
+  re-exports is a deterministic fix for the import rules.
+
+Next, before more model use: follow re-exports one hop, and resolve calls
+through module aliases (`import a.b as x; x.f()`, `from pkg import mod;
+mod.f()`) in the import rules, which would settle most of the 1,631 without
+asking; then more parallel requests (the wait is network, not CPU).
+
+## Further decision questions (planned)
 
 [Span-02](https://www.respan.ai/models/span-02) (Respan, through OpenRouter as
 `respan/span-02`) is a decision model: it answers typed questions (a choice,
