@@ -20,7 +20,7 @@
   with hosted Graphify's 198 shown callers.
 
 Built on branch `span-decisions`: Span-02 decisions (`decide`), rules learned
-from its answers, small windowed states (about a cent for a first run on
-Graphify's repo, answers cached by content).
+from its answers, small windowed states, rules for outside-repo calls (about $0.002 for a
+first run on Graphify's repo, answers cached by content).
 
 Not done: more languages, incremental re-indexing.
