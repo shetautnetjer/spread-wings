@@ -21,11 +21,28 @@ import .graph;
 
 let VERSION = "0.1.0";
 
+// "1.25" -> 1.25 (std has no float parser).
+fn parse_decimal(s: const u8[:]) -> f64, bool {
+    let dot = find(s, ".");
+    let whole, ok = parse_int(if dot >= 0 { s[..dot] } else { s });
+    guard ok else { return 0.0, false; }
+    var v = whole as f64;
+    if dot >= 0 {
+        var scale = 0.1;
+        for c in s[dot + 1..] {
+            guard c >= '0' && c <= '9' else { return 0.0, false; }
+            v = v + ((c - '0') as f64) * scale;
+            scale = scale / 10.0;
+        }
+    }
+    return v, true;
+}
+
 fn usage() {
     write_stderr("""
 spread-wings 0.1.0: a broad code graph from syntax alone
 
-  spread-wings index <repo> <graph.db>
+  spread-wings index <repo> <graph.db> [--resolution N]   (Louvain resolution, default 1.5)
   spread-wings overview <graph.db>
   spread-wings find <graph.db> <name>
   spread-wings neighbors <graph.db> <path>
@@ -43,7 +60,7 @@ fn abs_dir(p: const u8[:]) -> u8[>..] {
     return out;
 }
 
-fn index_main(repo_arg: const u8[:], db_path: const u8[:]) {
+fn index_main(repo_arg: const u8[:], db_path: const u8[:], gamma: f64) {
     let repo = abs_dir(repo_arg);
     guard is_dir(repo) else { abort(str("spread-wings: not a directory: ", repo)); }
     let t0 = clock();
@@ -53,14 +70,15 @@ fn index_main(repo_arg: const u8[:], db_path: const u8[:]) {
     let t1 = clock();
     let imports = link_imports(db);
     link_calls(db);
-    let rounds = communities(db);
+    let rounds = communities(db, gamma);
     set_meta(db, "root", repo);
     set_meta(db, "version", VERSION);
+    set_meta(db, "resolution", str(((gamma * 100.0) as i64)));
     sqlite::exec_or_die(db, "COMMIT");
     let t2 = clock();
     print(str("spread-wings: ", n, " files, ", scalar(db, "SELECT COUNT(*) FROM symbols"), " definitions, ",
               scalar(db, "SELECT COUNT(*) FROM calls"), " call sites, ", imports, " imports linked, ",
-              scalar(db, "SELECT COUNT(*) FROM call_edges"), " call links (by name), ",
+              scalar(db, "SELECT COUNT(*) FROM call_edges"), " call links, ",
               scalar(db, "SELECT COUNT(*) FROM communities"), " communities (", rounds, " rounds); parse ",
               ((t1 - t0) * 1000.0) as i64, " ms, link ", ((t2 - t1) * 1000.0) as i64, " ms -> ", db_path));
     sqlite::close(db);
@@ -110,7 +128,7 @@ fn overview(db: i64, out: u8[>..]&) {
     jint(out, "file_links", scalar(db, "SELECT COUNT(*) FROM file_edges")); out.push(',');
     out.append("\"evidence\":\"syntax only: links are matched by name or path, not compiler-resolved\",");
     out.append("\"communities\":[");
-    let st = sqlite::prepare_or_die(db, "SELECT id, label, size FROM communities ORDER BY id LIMIT 25");
+    let st = sqlite::prepare_or_die(db, "SELECT id, label, size, tests FROM communities ORDER BY id LIMIT 25");
     var first = true;
     while sqlite::step(st, err) == 1 {
         if !first { out.push(','); }
@@ -121,7 +139,8 @@ fn overview(db: i64, out: u8[>..]&) {
         out.push('{');
         jint(out, "id", cid); out.push(',');
         jstr(out, "label", label); out.push(',');
-        jint(out, "size", sqlite::col_int(st, 2)); out.push(',');
+        jint(out, "code_files", sqlite::col_int(st, 2)); out.push(',');
+        jint(out, "test_files", sqlite::col_int(st, 3)); out.push(',');
         out.append("\"main_files\":");
         // The files most linked to within and across communities.
         text_list(db, """
@@ -129,7 +148,7 @@ fn overview(db: i64, out: u8[>..]&) {
             LEFT JOIN (SELECT dst AS id, SUM(weight) AS w FROM file_edges GROUP BY dst) i ON i.id = f.id
             LEFT JOIN (SELECT src AS id, SUM(weight) AS w FROM file_edges GROUP BY src) o ON o.id = f.id
             WHERE f.community = ?1
-            ORDER BY COALESCE(i.w, 0) + COALESCE(o.w, 0) DESC, f.path LIMIT 5
+            ORDER BY f.is_test, COALESCE(i.w, 0) + COALESCE(o.w, 0) DESC, f.path LIMIT 5
             """, cid, out);
         out.append(",\"most_called\":");
         text_list(db, """
@@ -215,14 +234,21 @@ fn neighbors(db: i64, path: const u8[:], out: u8[>..]&) -> bool {
 fn callers(db: i64, name: const u8[:], out: u8[>..]&) {
     var err: u8[>..] = [];
     let st = sqlite::prepare_or_die(db, """
-        SELECT f.path, c.row, COALESCE(s.name, '') FROM calls c
+        SELECT f.path, c.row, COALESCE(s.name, ''),
+               COALESCE((SELECT group_concat(DISTINCT e.resolution) FROM call_edges e
+                         WHERE e.file_id = c.file_id AND e.row = c.row
+                           AND e.callee IN (SELECT id FROM symbols WHERE name = ?1)), 'unlinked'),
+               COALESCE((SELECT group_concat(DISTINCT tf.path) FROM call_edges e
+                         JOIN symbols t ON t.id = e.callee JOIN files tf ON tf.id = t.file_id
+                         WHERE e.file_id = c.file_id AND e.row = c.row AND t.name = ?1), '')
+        FROM calls c
         JOIN files f ON f.id = c.file_id LEFT JOIN symbols s ON s.id = c.in_symbol
-        WHERE c.callee = ?1 ORDER BY f.path, c.row LIMIT 200
+        WHERE c.callee = ?1 ORDER BY f.path, c.row LIMIT 500
         """);
     sqlite::bind_text(st, 1, name);
     out.append("{\"name\":");
     json::format_string(out, name);
-    out.append(",\"evidence\":\"matched by name: a call to any definition named this\",\"sites\":[");
+    out.append(",\"evidence\":\"each site's resolution says how it was tied to a definition: same_file, imported_name, imported_file, or by_name (any definition with this name)\",\"sites\":[");
     var first = true;
     while sqlite::step(st, err) == 1 {
         if !first { out.push(','); }
@@ -234,7 +260,13 @@ fn callers(db: i64, name: const u8[:], out: u8[>..]&) {
         out.push('{');
         jstr(out, "path", p); out.push(',');
         jint(out, "line", sqlite::col_int(st, 1)); out.push(',');
-        jstr(out, "in", inside);
+        jstr(out, "in", inside); out.push(',');
+        var res: u8[>..] = [];
+        var tgt: u8[>..] = [];
+        sqlite::col_text(st, 3, res);
+        sqlite::col_text(st, 4, tgt);
+        jstr(out, "resolution", res); out.push(',');
+        jstr(out, "defined_in", tgt);
         out.push('}');
     }
     sqlite::finalize(st);
@@ -336,7 +368,16 @@ fn main() {
     let a = args();
     if a.len < 3 { usage(); }
     let cmd = a[1];
-    if cmd == "index" && a.len == 4 { index_main(a[2], a[3]); return; }
+    if cmd == "index" && (a.len == 4 || (a.len == 6 && a[4] == "--resolution")) {
+        var gamma = 1.5;   // measured: on a test-heavy repo, 1.5 splits code into its modules
+        if a.len == 6 {
+            let g, ok = parse_decimal(a[5]);
+            guard ok && g > 0.0 && g <= 10.0 else { abort("spread-wings: --resolution needs a number between 0 and 10"); }
+            gamma = g;
+        }
+        index_main(a[2], a[3], gamma);
+        return;
+    }
     if cmd == "serve" && a.len == 3 { serve_main(a[2]); return; }
     let db = open_map(a[2]);
     var out: u8[>..] = [];

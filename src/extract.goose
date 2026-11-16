@@ -192,121 +192,78 @@ fn extract_repo(db: i64, repo: const u8[:]) -> i64 {
     let all_paths = split(paths, '\n');
     let all_langs = split(plangs, '\n');
 
-    let ins_sym = sqlite::prepare_or_die(db, "INSERT INTO symbols (file_id, name, kind, row, start, end_) VALUES (?1, ?2, ?3, ?4, ?5, ?6)");
-    let ins_imp = sqlite::prepare_or_die(db, "INSERT INTO imports (file_id, module, row) VALUES (?1, ?2, ?3)");
-    let ins_call = sqlite::prepare_or_die(db, "INSERT INTO calls (file_id, row, start, callee, in_symbol) VALUES (?1, ?2, ?3, ?4, 0)");
-    for li in 0..LANGS.len {
-        // An owned copy: treesitter::compile reuses its own buffers, which a
-        // slice of the language list could otherwise alias.
-        var lang: u8[>..] = [];
-        lang.append(LANGS[li]);
-        // This language's files, as search_files wants them, and their row ids.
-        var list: u8[>..] = [];
-        var ids: i64[>..] = [];
-        for i in 0..pids.len {
-            if all_langs[i] == lang { list.append(all_paths[i]); list.push('\n'); ids.push(pids[i]); }
-        }
-        guard ids.len > 0 else { continue; }
-        each_split(patterns(lang), '\n') { line =>
-            let f = split(line, '\t');
-            guard f.len == 3;
-            var why: u8[>..] = [];
-            if treesitter::compile(lang, f[2], why) {
-            treesitter::search_files(list) { idx, start, end, row, col, caps =>
-                let fid = ids[idx];
-                let text = capture(caps, f[1]);
-                guard text.len > 0;
-                if f[0] == "mod" {
-                    sqlite::reset(ins_imp);
-                    sqlite::bind_int(ins_imp, 1, fid);
-                    sqlite::bind_text(ins_imp, 2, str("mod::", text));
-                    sqlite::bind_int(ins_imp, 3, row + 1);
-                    sqlite::step_done(ins_imp);
-                } else if f[0] == "import" && lang == "python" && trim(text).len > 0 && only_dots(trim(text)) {
-                    // `from . import a, b`: the modules are a and b, beside this file.
-                    each_split(capture(caps, "X"), ',') { x =>
-                        let name = trim(x);
-                        let sp = find(name, " ");   // `a as b`
-                        let base = if sp > 0 { name[..sp] } else { name };
-                        if base.len > 0 && base != "*" && base != "(" {
-                            sqlite::reset(ins_imp);
-                            sqlite::bind_int(ins_imp, 1, fid);
-                            sqlite::bind_text(ins_imp, 2, str(trim(text), base));
-                            sqlite::bind_int(ins_imp, 3, row + 1);
-                            sqlite::step_done(ins_imp);
-                        }
-                    };
-                } else if f[0] == "import" {
-                    let m = module_name(text);
-                    guard m.len > 0;
-                    sqlite::reset(ins_imp);
-                    sqlite::bind_int(ins_imp, 1, fid);
-                    sqlite::bind_text(ins_imp, 2, m);
-                    sqlite::bind_int(ins_imp, 3, row + 1);
-                    sqlite::step_done(ins_imp);
-                } else if f[0] == "call" {
-                    let c = callee_name(text);
-                    guard c.len > 0;
-                    sqlite::reset(ins_call);
-                    sqlite::bind_int(ins_call, 1, fid);
-                    sqlite::bind_int(ins_call, 2, row + 1);
-                    sqlite::bind_int(ins_call, 3, start);
-                    sqlite::bind_text(ins_call, 4, c);
-                    sqlite::step_done(ins_call);
-                } else {
-                    let name = callee_name(text);
-                    guard name.len > 0;
-                    sqlite::reset(ins_sym);
-                    sqlite::bind_int(ins_sym, 1, fid);
-                    sqlite::bind_text(ins_sym, 2, name);
-                    sqlite::bind_text(ins_sym, 3, f[0]);
-                    sqlite::bind_int(ins_sym, 4, row + 1);
-                    sqlite::bind_int(ins_sym, 5, start);
-                    sqlite::bind_int(ins_sym, 6, end);
-                    sqlite::step_done(ins_sym);
-                }
-            };
-            } else {
-                write_stderr(str("spread-wings: pattern skipped for ", lang, ": ", f[2], " (", why, ")\n"));
-            }
-        };
-    }
-    // ES modules: `import ... from "m"`, `import "m"`, `export ... from "m"`.
-    // A pattern can't hold the module (it must be a string literal), and the
-    // statement is one line in practice, so these are read from the text.
+    // Every file goes to a pool of worker threads, one per hardware thread,
+    // taking files from one queue as they finish (a big file doesn't hold
+    // the rest up). A worker parses its file once and runs all of the
+    // language's patterns on that tree. Results come back as records and are
+    // written here, in file order, so the graph is the same every run.
     for i in 0..pids.len {
-        let l = all_langs[i];
-        guard l == "typescript" || l == "tsx" || l == "javascript" else { continue; }
-        var text: u8[>..] = [];
-        guard read_file(all_paths[i], text) else { continue; }
-        var row = 0;
-        each_split(text, '\n') { raw =>
-            row++;
-            let line = trim(raw);
-            if starts_with(line, "import ") || starts_with(line, "import\"") || starts_with(line, "import'") || starts_with(line, "export ") {
-                var at = find(line, " from ");
-                if at >= 0 { at = at + 6; } else if starts_with(line, "import") { at = 6; } else { at = -1; }
-                if at >= 0 {
-                    let rest = trim(line[at..]);
-                    if rest.len >= 2 && (rest[0] == '"' || rest[0] == '\'') {
-                        let close = find(rest[1..], rest[..1]);
-                        if close > 0 {
-                            sqlite::reset(ins_imp);
-                            sqlite::bind_int(ins_imp, 1, pids[i]);
-                            sqlite::bind_text(ins_imp, 2, rest[1..1 + close]);
-                            sqlite::bind_int(ins_imp, 3, row);
-                            sqlite::step_done(ins_imp);
-                        }
-                    }
-                }
+        var job = FileJob { idx: i, .. };
+        job.path.append(all_paths[i]);
+        job.lang.append(all_langs[i]);
+        qput(job);
+    }
+    let workers = max(1, min(hardware_threads(), pids.len));
+    for w in 0..workers { qput(FileJob { idx: -1, .. }); }
+    var tids: i64[>..] = [];
+    for w in 0..workers { tids.push(thread_spawn(extract_worker)); }
+    var all: u8[>..] = [];
+    var at: i64[>..] = [];
+    var len: i64[>..] = [];
+    at.resize(pids.len, 0);
+    len.resize(pids.len, 0);
+    for k in 0..pids.len {
+        let d = qget<FileDone>();
+        at[d.idx] = all.len;
+        len[d.idx] = d.data.len;
+        all.append(d.data);
+    }
+    for t in tids { thread_wait(t); }
+
+    let ins_sym = sqlite::prepare_or_die(db, "INSERT INTO symbols (file_id, name, kind, row, start, end_) VALUES (?1, ?2, ?3, ?4, ?5, ?6)");
+    let ins_imp = sqlite::prepare_or_die(db, "INSERT INTO imports (file_id, module, row, names) VALUES (?1, ?2, ?3, ?4)");
+    let ins_call = sqlite::prepare_or_die(db, "INSERT INTO calls (file_id, row, start, callee, in_symbol) VALUES (?1, ?2, ?3, ?4, 0)");
+    for i in 0..pids.len {
+        let fid = pids[i];
+        // Records: kind 0x1f a 0x1f b 0x1f start 0x1f end 0x1f row 0x1e
+        each_split(all[at[i]..at[i] + len[i]], 0x1e) { rec =>
+            let f = split(rec, 0x1f);
+            guard f.len == 6;
+            let st, ok1 = parse_int(f[3]);
+            let en, ok2 = parse_int(f[4]);
+            let row, ok3 = parse_int(f[5]);
+            guard ok1 && ok2 && ok3;
+            if f[0] == "import" {
+                sqlite::reset(ins_imp);
+                sqlite::bind_int(ins_imp, 1, fid);
+                sqlite::bind_text(ins_imp, 2, f[1]);
+                sqlite::bind_int(ins_imp, 3, row);
+                sqlite::bind_text(ins_imp, 4, f[2]);
+                sqlite::step_done(ins_imp);
+            } else if f[0] == "call" {
+                sqlite::reset(ins_call);
+                sqlite::bind_int(ins_call, 1, fid);
+                sqlite::bind_int(ins_call, 2, row);
+                sqlite::bind_int(ins_call, 3, st);
+                sqlite::bind_text(ins_call, 4, f[1]);
+                sqlite::step_done(ins_call);
+            } else {
+                sqlite::reset(ins_sym);
+                sqlite::bind_int(ins_sym, 1, fid);
+                sqlite::bind_text(ins_sym, 2, f[1]);
+                sqlite::bind_text(ins_sym, 3, f[0]);
+                sqlite::bind_int(ins_sym, 4, row);
+                sqlite::bind_int(ins_sym, 5, st);
+                sqlite::bind_int(ins_sym, 6, en);
+                sqlite::step_done(ins_sym);
             }
         };
     }
     sqlite::finalize(ins_sym);
     sqlite::finalize(ins_imp);
     sqlite::finalize(ins_call);
-    // Two patterns can match one definition (`fn` and `pub fn` don't, but a
-    // const arrow and a call can overlap): keep one row per place.
+    // Two patterns can match one definition (a const arrow and a call can
+    // overlap): keep one row per place.
     sqlite::exec_or_die(db, """
         DELETE FROM symbols WHERE id NOT IN (
             SELECT MIN(id) FROM symbols GROUP BY file_id, start, name);
@@ -316,12 +273,156 @@ fn extract_repo(db: i64, repo: const u8[:]) -> i64 {
             WHERE s.file_id = calls.file_id AND s.start <= calls.start AND calls.start < s.end_
               AND s.kind IN ('function', 'impl')
             ORDER BY s.end_ - s.start LIMIT 1), 0);
-        -- A definition's own pattern also matches as a call in some grammars
-        -- (`require(...)`); a call at a definition's exact start is not one.
+        -- A definition's own text also matches the call pattern in some
+        -- grammars; a call at a definition's exact start is not one.
         DELETE FROM calls WHERE EXISTS (
             SELECT 1 FROM symbols s WHERE s.file_id = calls.file_id AND s.start = calls.start);
     """);
     return pids.len;
+}
+
+struct FileJob { idx: i64, lang: u8[..16], path: u8[>..] }
+struct FileDone { idx: i64, data: u8[>..] }
+
+fn record(out: u8[>..]&, kind: const u8[:], a: const u8[:], b: const u8[:], start: i64, end: i64, row: i64) {
+    format(out, kind, "\x1f", a, "\x1f", b, "\x1f", start, "\x1f", end, "\x1f", row);
+    out.push(0x1e);
+}
+
+// Matches the compiled pattern against the tree the worker already loaded
+// (treesitter's t_nodes), so one parse serves every pattern.
+fn search_loaded<F>() {
+    for i in 0..treesitter::t_nodes.len / treesitter::R {
+        treesitter::nb = 0;
+        if (treesitter::flags(treesitter::t_nodes, i) & treesitter::F_EXTRA) == 0 && treesitter::match_node(treesitter::p_root, i) { F(i); }
+    }
+}
+
+// The captures of the current match as name 0x1f text 0x1e.
+fn current_captures(out: u8[>..]&) {
+    treesitter::each_binding() { name, text =>
+        out.append(name);
+        out.push(0x1f);
+        out.append(text);
+        out.push(0x1e);
+    };
+}
+
+// The local names an import statement binds, comma-separated: `a, b as c`
+// gives `a,c`; braces and `*` are skipped.
+fn import_names(raw: const u8[:], out: u8[>..]&) {
+    each_split(raw, ',') { part =>
+        var p = trim(part);
+        while p.len > 0 && (p[0] == '{' || p[0] == '(') { p = trim(p[1..]); }
+        while p.len > 0 && (p[p.len - 1] == '}' || p[p.len - 1] == ')') { p = trim(p[..p.len - 1]); }
+        let as_at = find(p, " as ");
+        let name = if as_at > 0 { trim(p[as_at + 4..]) } else { p };
+        // `a::b::C` binds C
+        let last = rfind(name, "::");
+        let n2 = if last >= 0 { name[last + 2..] } else { name };
+        if n2.len > 0 && n2 != "*" && n2 != "self" && callee_name(n2) == n2 {
+            if out.len > 0 { out.push(','); }
+            out.append(n2);
+        }
+    };
+}
+
+thread_fn extract_worker() {
+    loop {
+        let job = qget<FileJob>();
+        guard job.idx >= 0 else { break; }
+        var done = FileDone { idx: job.idx, .. };
+        var text: u8[>..] = [];
+        if read_file(job.path, text) {
+            treesitter::t_text.clear();
+            treesitter::t_text.append(text);
+            if treesitter::parse(job.lang, treesitter::t_text, treesitter::t_nodes) {
+                each_split(patterns(job.lang), '\n') { line =>
+                    let f = split(line, '\t');
+                    if f.len == 3 {
+                        var why: u8[>..] = [];
+                        if treesitter::compile(job.lang, f[2], why) {
+                            search_loaded() { node =>
+                                var caps: u8[>..] = [];
+                                current_captures(caps);
+                                let text = capture(caps, f[1]);
+                                let st = treesitter::match_start(node);
+                                let en = treesitter::match_end(node);
+                                let row = treesitter::match_row(node) + 1;
+                                if text.len > 0 {
+                                    if f[0] == "mod" {
+                                        record(done.data, "import", str("mod::", text), "", st, en, row);
+                                    } else if f[0] == "import" {
+                                        var names: u8[>..] = [];
+                                        let t = trim(text);
+                                        // The names after `import`, from the statement's own text
+                                        // (a `$$$X` capture can come back empty here).
+                                        let stmt = treesitter::match_text(node);
+                                        let imp_at = find(stmt, " import ");
+                                        let after = if imp_at >= 0 { stmt[imp_at + 8..] } else { "" };
+                                        if job.lang == "python" && only_dots(t) {
+                                            // `from . import a, b`: the modules a and b, beside this file.
+                                            each_split(after, ',') { x =>
+                                                names.clear();
+                                                import_names(x, names);
+                                                if names.len > 0 { record(done.data, "import", str(t, names), "", st, en, row); }
+                                            };
+                                        } else {
+                                            if job.lang == "python" { import_names(after, names); }
+                                            if job.lang == "rust" {
+                                                let brace = find(t, "::{");
+                                                if brace > 0 { import_names(t[brace + 3..], names); }
+                                                else { import_names(t, names); }
+                                            }
+                                            let m = module_name(text);
+                                            if m.len > 0 { record(done.data, "import", m, names, st, en, row); }
+                                        }
+                                    } else if f[0] == "call" {
+                                        let c = callee_name(text);
+                                        if c.len > 0 { record(done.data, "call", c, "", st, en, row); }
+                                    } else {
+                                        let name = callee_name(text);
+                                        if name.len > 0 { record(done.data, f[0], name, "", st, en, row); }
+                                    }
+                                }
+                            };
+                        }
+                    }
+                };
+            }
+            // ES modules: `import ... from "m"`, `import "m"`, `export ... from "m"`,
+            // read from the text (a pattern can't hold the module string).
+            if job.lang == "typescript" || job.lang == "tsx" || job.lang == "javascript" {
+                var row = 0;
+                each_split(text, '\n') { raw =>
+                    row++;
+                    let line = trim(raw);
+                    if starts_with(line, "import ") || starts_with(line, "import\"") || starts_with(line, "import'") || starts_with(line, "export ") {
+                        var at = find(line, " from ");
+                        if at >= 0 { at = at + 6; } else if starts_with(line, "import") { at = 6; } else { at = -1; }
+                        if at >= 0 {
+                            let rest = trim(line[at..]);
+                            if rest.len >= 2 && (rest[0] == '"' || rest[0] == '\'') {
+                                let close = find(rest[1..], rest[..1]);
+                                if close > 0 {
+                                    // The names: `import a, { b, c as d } from` gives a,b,d.
+                                    var names: u8[>..] = [];
+                                    let head_end = find(line, " from ");
+                                    if head_end > 7 && starts_with(line, "import ") {
+                                        var head = trim(line[7..head_end]);
+                                        if starts_with(head, "type ") { head = trim(head[5..]); }
+                                        import_names(head, names);
+                                    }
+                                    record(done.data, "import", rest[1..1 + close], names, 0, 0, row);
+                                }
+                            }
+                        }
+                    }
+                };
+            }
+        }
+        qput(done);
+    }
 }
 
 fn only_dots(s: const u8[:]) -> bool {

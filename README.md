@@ -19,14 +19,22 @@ rebuilt to be fast, local and honest about what it knows.
 - **Fast.** Goose compiles to C. Spread-Wings starts instantly and parses on
   every core, so re-indexing after every change is cheap:
 
-  | Repository | Files | Definitions | Call sites | Index time |
-  |---|---|---|---|---|
-  | a small Rust workspace | 20 | 180 | 1,176 | 0.13 s |
-  | Understand-Anything | 324 | 1,048 | 28,413 | 0.4 s |
-  | Graphify | 701 | 13,383 | 87,628 | 2.1 s |
-  | pydantic/monty | 1,575 | 18,460 | 138,748 | 3.1 s |
+  | Repository | Files | Definitions | Call sites | Parse | Link + communities |
+  |---|---|---|---|---|---|
+  | a small Rust workspace | 20 | 180 | 1,176 | 0.07 s | 0.01 s |
+  | Understand-Anything | 324 | 1,254 | 28,413 | 0.12 s | 0.02 s |
+  | Graphify | 701 | 13,383 | 87,628 | 0.85 s | 0.25 s |
+  | pydantic/monty | 1,574 | 23,009 | 138,682 | 0.89 s | 0.86 s |
 
-  (One Linux machine, 32 threads, warm disk cache.)
+  (One Linux machine, 32 hardware threads, warm disk cache.) Files go to a
+  pool of worker threads, one per hardware thread, taking work from one
+  queue; each file is parsed once and every pattern runs on that tree.
+- **Accurate on what it claims.** On Graphify's own repo (commit `52cb282`),
+  checked against Python's own parser: 13,127 of 13,127 functions, 206 of
+  206 classes, every call site of six test names, and all 107 files that
+  import `graphify/build.py`. All 262 calls of `build_from_json`, a name
+  defined in six places, resolve to exactly one definition; the 198 callers
+  hosted Graphify shows agree with every one of them.
 - **Nothing to trust.** It never runs a repository's code, builds or package
   managers. It only parses files, so any repository can be indexed by an agent
   with no human approval.
@@ -43,13 +51,18 @@ rebuilt to be fast, local and honest about what it knows.
   [goose-treesitter](https://github.com/shetautnetjer/goose-treesitter)
   patterns run on every core.
 - **Links**: imports resolved to files (relative TS/JS paths, Python modules,
-  Rust `mod`, `crate::`, `self::`, `super::` and workspace crates), and calls
-  linked to definitions with the same name (the same file first; a name with
-  several definitions shares its weight; names defined in more than 8 places
-  aren't linked).
-- **Communities**: groups of files that import and call each other, found
-  with Louvain clustering (deterministic), each named after its most linked
-  file, with its main files and most-called definitions.
+  Rust `mod`, `crate::`, `self::`, `super::` and workspace crates), and each
+  call tied to a definition by the strongest evidence the code gives, first
+  match wins: **same_file**; **imported_name** (the caller's file imports
+  that name from a file defining it); **imported_file** (it imports a file
+  defining it); else **by_name** (any definition with that name, for names
+  defined in at most 8 places). Every link stores which rule decided it.
+- **Communities**: groups of code files that import and call each other,
+  found with Louvain clustering (deterministic, resolution 1.5 by default,
+  `--resolution N` to change). Test files don't form groups of their own:
+  each joins the community of the code it uses most. Each community is named
+  after its most linked code file and lists its code files, test files, main
+  files and most-called definitions.
 - Stored in one SQLite file through
   [goose-sqlite](https://github.com/shetautnetjer/goose-sqlite).
 
@@ -57,7 +70,7 @@ rebuilt to be fast, local and honest about what it knows.
 
 ```bash
 scripts/build.sh                      # needs the Goose compiler (GOOSE=/path/to/goose)
-bin/spread-wings index ~/code/myrepo myrepo.db
+bin/spread-wings index ~/code/myrepo myrepo.db              # --resolution 2 for smaller communities
 bin/spread-wings overview myrepo.db   # communities, main files, most-called names
 bin/spread-wings find myrepo.db parse_config
 bin/spread-wings neighbors myrepo.db src/config.py
@@ -79,11 +92,9 @@ All output is JSON.
   PHP, Lua, GDScript, shaders); their patterns come next.
 - Patterns match fixed shapes, so unusual definitions can be missed (for
   example a Python function inside a decorator factory's return).
-- `from . import x` in Python isn't linked yet.
-- Calls are matched by name: two functions with the same name aren't told
-  apart, and method calls aren't tied to their class.
-- Large repos can produce one big community where code is densely linked by
-  common names. A resolution setting comes next.
+- Method calls on objects (`x.get()`) need type information, so most stay
+  `by_name` (on Graphify's repo, 51,158 of 78,761 links). That's what the
+  0.2 decision step is for.
 
 ## Documents
 
