@@ -25,9 +25,13 @@ together: Spread-Wings to find the area, Swan to answer inside it.
    Symlinked folders are not entered.
 2. **Extract** (`src/extract.goose`). For each language, a short list of
    goose-treesitter patterns (`def $NAME($$$A) -> $R: $$$B`,
-   `pub fn $NAME($$$A) { $$$B }`, `$F($$$A)`, ...) runs with
-   `treesitter::search_files`, which parses files on every core with Goose
-   threads. Each match becomes a fact: a definition (name, kind, line, byte
+   `pub fn $NAME($$$A) { $$$B }`, `$F($$$A)`, ...). Files go to a pool of
+   Goose worker threads, one per hardware thread, pulling from one queue, so
+   a big file doesn't hold the others up. A worker parses its file once and
+   matches every pattern against that tree (`search_loaded`), instead of
+   parsing it again per pattern; this halved to thirded parse time. Results
+   come back to the main thread, which writes them in file order, so the
+   graph is identical every run. Each match becomes a fact: a definition (name, kind, line, byte
    span), an import (module text) or a call site (callee name). ES `import`
    and `export ... from` lines are read from the text, since a pattern can't
    hold the module string.
@@ -36,16 +40,27 @@ together: Spread-Wings to find the area, Swan to answer inside it.
      `crate::`, `self::`, `super::` and workspace crates by name (`foo_bar`
      is a `foo-bar/src/lib.rs`).
    - Each call site is placed in the innermost definition that spans it.
-   - Calls are linked to definitions with the callee's name: the same file
-     first (weight 1), otherwise every definition of that name, the weight
-     shared. Names with more than 8 definitions aren't linked.
+   - Each call is tied to definitions by the first rule that applies:
+     `same_file`; `imported_name` (the caller's file imports that name, as
+     `from m import f`, `import { f } from "./m"` or `use m::{F}`, from a file
+     defining it); `imported_file` (it imports a file defining it);
+     `by_name` (any definition of that name, only for names with at most 8
+     definitions). Definitions at one level share the call's weight. The
+     rule is stored on the link and shown per call site.
 4. **File graph.** An import is weight 1. A call link counts 0.3 times its
    weight, and only for names defined in at most 3 files, so generic names
    (`new`, `parse`) don't glue unrelated files together.
-5. **Communities.** Louvain clustering: local moving to the best modularity
-   gain, then each community becomes one node, until nothing moves. It runs
-   on flat CSR arrays in Goose; SQLite merges the levels. Deterministic. Each
-   community is named after its most linked file.
+5. **Communities.** Louvain clustering over the **code files only**: local
+   moving to the best modularity gain (resolution γ, 1.5 by default), then
+   each community becomes one node, until nothing moves. It runs on flat CSR
+   arrays in Goose; SQLite merges the levels. Deterministic. Test files are
+   then attached, each to the code community it links to most; tests linked
+   to no code share one community. On a test-heavy repo (Graphify: 118 code
+   files, 571 test files) clustering everything together made each community
+   "a module and its hundreds of tests"; clustering code first gives the
+   modules themselves (extractors, CLI and serve, extraction core, cache and
+   install, watch, LLM). γ = 1 left 3 large groups there, γ = 2 started
+   merging unrelated files; 1.5 was the clearest.
 6. **Serve.** CLI and MCP tools read the SQLite file.
 
 Label propagation was tried first and dropped: one hub file imported
@@ -77,9 +92,10 @@ marked **decided**:
 
 - **Layer of a file**: a choice among `api`, `domain`, `data`, `ui`, `infra`,
   `test`, `tooling`, `docs`, from its path, imports and definitions.
-- **Name ambiguity**: when a call's name has several definitions, which one
-  is most likely meant (a choice among them), from the call's line and the
-  candidates' signatures. This replaces the shared weight with a probability.
+- **Name ambiguity**: for calls still `by_name` after the import rules
+  (mostly method calls on objects), which definition is most likely meant
+  (a choice among them), from the call's line and the candidates'
+  signatures. This replaces the shared weight with a probability.
 - **Doc to code**: does this README or doc section describe this module
   (yes/no), for links from docs to code.
 - **Community name**: a choice among labels built from the community's own

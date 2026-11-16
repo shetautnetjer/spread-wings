@@ -5,12 +5,18 @@
 - Languages: Python, TypeScript, TSX, JavaScript, Rust.
 - `index`, `overview`, `find`, `neighbors`, `callers`, and `serve` (MCP over
   stdio with the same four tools).
-- Louvain communities, deterministic.
-- `tests/test.sh`: 17 checks on a mixed-language fixture (definitions,
+- Calls tied to definitions by evidence: same_file, imported_name,
+  imported_file, then by_name; the rule is stored and shown per call site.
+- Louvain communities over code files (resolution 1.5, `--resolution`), test
+  files attached to the code they use.
+- Extraction on a worker pool (one thread per hardware thread, one queue),
+  each file parsed once for all patterns.
+- `tests/test.sh`: 22 checks on a mixed-language fixture (definitions,
   imports per language, calls by name, determinism, MCP framing and errors),
   all passing.
-- Measured: 0.13 s for a 20-file Rust workspace, 2.1 s for Graphify's own
-  repo (701 files, 13,383 definitions, 87,628 call sites).
+- Measured: Graphify's repo (701 files) parses in 0.85 s and links in 0.25 s;
+  checked against Python's parser, definitions, call sites and importers are
+  exact; all 262 `build_from_json` calls resolve to one definition and agree
+  with hosted Graphify's 198 shown callers.
 
-Not done: Span-02 decisions (0.2), more languages, `from . import x` in
-Python, incremental re-indexing.
+Not done: Span-02 decisions (0.2), more languages, incremental re-indexing.

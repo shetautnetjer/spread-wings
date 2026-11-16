@@ -161,7 +161,8 @@ fn import_candidates(lang: const u8[:], importer: const u8[:], module: const u8[
 
 fn link_imports(db: i64) -> i64 {
     var err: u8[>..] = [];
-    let q = sqlite::prepare_or_die(db, "SELECT i.file_id, f.path, f.lang, i.module FROM imports i JOIN files f ON f.id = i.file_id");
+    let q = sqlite::prepare_or_die(db, "SELECT i.file_id, f.path, f.lang, i.module, i.rowid FROM imports i JOIN files f ON f.id = i.file_id");
+    let set_dst = sqlite::prepare_or_die(db, "UPDATE imports SET dst = ?2 WHERE rowid = ?1");
     let find_st = sqlite::prepare_or_die(db, "SELECT id FROM files WHERE path = ?1");
     let like_st = sqlite::prepare_or_die(db, "SELECT id FROM files WHERE path LIKE ?1 ORDER BY length(path) LIMIT 1");
     let ins = sqlite::prepare_or_die(db, "INSERT INTO file_edges (src, dst, kind, weight) VALUES (?1, ?2, 'import', 1.0)");
@@ -178,6 +179,10 @@ fn link_imports(db: i64) -> i64 {
         import_candidates(lang, path, module, cands);
         let dst = first_file(find_st, like_st, cands);
         if dst != 0 && dst != src {
+            sqlite::reset(set_dst);
+            sqlite::bind_int(set_dst, 1, sqlite::col_int(q, 4));
+            sqlite::bind_int(set_dst, 2, dst);
+            sqlite::step_done(set_dst);
             sqlite::reset(ins);
             sqlite::bind_int(ins, 1, src);
             sqlite::bind_int(ins, 2, dst);
@@ -188,40 +193,81 @@ fn link_imports(db: i64) -> i64 {
     sqlite::finalize(q);
     sqlite::finalize(find_st);
     sqlite::finalize(like_st);
+    sqlite::finalize(set_dst);
     sqlite::finalize(ins);
     return n;
 }
 
+// Each call site is tied to the definitions its name could mean, by the
+// strongest evidence the code gives, first match wins:
+//   same_file      a definition with that name in the caller's own file;
+//   imported_name  the caller's file imports that name from a file that
+//                  defines it (`from m import f`, `import { f }`, `use m::F`);
+//   imported_file  the caller's file imports a file that defines it;
+//   by_name        any definition with that name (only for names defined in
+//                  at most 8 places).
+// Several definitions at one level share the call's weight. The rule used
+// is stored on the link as `resolution`.
 fn link_calls(db: i64) {
     sqlite::exec_or_die(db, """
-        -- A definition with the callee's name in the same file wins outright.
-        INSERT INTO call_edges (caller, callee, file_id, row, weight, by_name)
-        SELECT c.in_symbol, s.id, c.file_id, c.row, 1.0, 1
-        FROM calls c JOIN symbols s ON s.file_id = c.file_id AND s.name = c.callee AND s.kind IN ('function', 'class', 'struct', 'enum', 'trait', 'interface');
-        -- Otherwise every definition with that name elsewhere, the weight shared.
-        WITH counts AS (SELECT name, COUNT(*) AS n FROM symbols WHERE kind IN ('function', 'class', 'struct', 'enum', 'trait', 'interface') GROUP BY name)
-        INSERT INTO call_edges (caller, callee, file_id, row, weight, by_name)
-        SELECT c.in_symbol, s.id, c.file_id, c.row, 1.0 / k.n, 1
-        FROM calls c
-        JOIN counts k ON k.name = c.callee AND k.n <= 8
-        JOIN symbols s ON s.name = c.callee AND s.kind IN ('function', 'class', 'struct', 'enum', 'trait', 'interface')
-        WHERE NOT EXISTS (SELECT 1 FROM symbols t WHERE t.file_id = c.file_id AND t.name = c.callee AND t.kind IN ('function', 'class', 'struct', 'enum', 'trait', 'interface'));
-        -- File links from calls count for less than an import: a call is
-        -- matched by name, an import names its file. Names defined in more
-        -- than 3 files (`new`, `parse`) are too generic to tie files together.
+        CREATE TEMP TABLE defs AS
+            SELECT s.id AS sid, s.file_id AS sfile, s.name AS name FROM symbols s
+            WHERE s.kind IN ('function', 'class', 'struct', 'enum', 'trait', 'interface');
+        CREATE INDEX defs_name ON defs(name);
+        CREATE TEMP TABLE ndefs AS SELECT name, COUNT(*) AS n FROM defs GROUP BY name;
+        CREATE INDEX ndefs_name ON ndefs(name);
+        -- Candidate definitions per call site, for names defined in at most 50 places.
+        CREATE TEMP TABLE cands AS
+            SELECT c.rowid AS cid, c.file_id AS cfile, c.callee AS name, d.sid, d.sfile, k.n
+            FROM calls c JOIN ndefs k ON k.name = c.callee AND k.n <= 50
+            JOIN defs d ON d.name = c.callee;
+        CREATE INDEX cands_cid ON cands(cid);
+        CREATE TEMP TABLE chosen (cid INTEGER, sid INTEGER, resolution TEXT);
+        CREATE TEMP TABLE done (cid INTEGER PRIMARY KEY);
+
+        INSERT INTO chosen SELECT cid, sid, 'same_file' FROM cands WHERE sfile = cfile;
+        INSERT OR IGNORE INTO done SELECT cid FROM chosen;
+
+        INSERT INTO chosen
+            SELECT c.cid, c.sid, 'imported_name' FROM cands c
+            WHERE c.cid NOT IN (SELECT cid FROM done)
+              AND EXISTS (SELECT 1 FROM imports i WHERE i.file_id = c.cfile AND i.dst = c.sfile
+                          AND (',' || i.names || ',') LIKE ('%,' || c.name || ',%'));
+        INSERT OR IGNORE INTO done SELECT cid FROM chosen;
+
+        INSERT INTO chosen
+            SELECT c.cid, c.sid, 'imported_file' FROM cands c
+            WHERE c.cid NOT IN (SELECT cid FROM done)
+              AND EXISTS (SELECT 1 FROM imports i WHERE i.file_id = c.cfile AND i.dst = c.sfile);
+        INSERT OR IGNORE INTO done SELECT cid FROM chosen;
+
+        INSERT INTO chosen
+            SELECT c.cid, c.sid, 'by_name' FROM cands c
+            WHERE c.cid NOT IN (SELECT cid FROM done) AND c.n <= 8;
+
+        INSERT INTO call_edges (caller, callee, file_id, row, weight, by_name, resolution)
+            SELECT c.in_symbol, ch.sid, c.file_id, c.row,
+                   1.0 / COUNT(*) OVER (PARTITION BY ch.cid), 1, ch.resolution
+            FROM chosen ch JOIN calls c ON c.rowid = ch.cid;
+
+        -- File links from calls count for less than an import: weight 0.3,
+        -- and by_name links only for names defined in at most 3 files, so
+        -- generic names (`new`, `parse`) don't tie unrelated files together.
         INSERT INTO file_edges (src, dst, kind, weight)
-        SELECT e.file_id, s.file_id, 'call', 0.3 * SUM(e.weight)
-        FROM call_edges e JOIN symbols s ON s.id = e.callee
-        WHERE s.file_id != e.file_id
-          AND (SELECT COUNT(DISTINCT t.file_id) FROM symbols t WHERE t.name = s.name) <= 3
-        GROUP BY e.file_id, s.file_id;
+            SELECT e.file_id, s.file_id, 'call', 0.3 * SUM(e.weight)
+            FROM call_edges e JOIN symbols s ON s.id = e.callee
+            WHERE s.file_id != e.file_id
+              AND (e.resolution != 'by_name'
+                   OR (SELECT COUNT(DISTINCT d.sfile) FROM defs d WHERE d.name = s.name) <= 3)
+            GROUP BY e.file_id, s.file_id;
+        DROP TABLE defs; DROP TABLE ndefs; DROP TABLE cands; DROP TABLE chosen; DROP TABLE done;
     """);
 }
 
 // One level of Louvain's local moving on a graph in CSR form (off, nbr, w):
 // each node moves to the neighboring community with the best modularity
 // gain until no node moves. Returns true if any node moved.
-fn local_moving(n: i64, off: const i64[:], nbr: const i64[:], w: const f64[:], comm: i64[>..]&) -> bool {
+fn local_moving(n: i64, off: const i64[:], nbr: const i64[:], w: const f64[:], comm: i64[>..]&, gamma: f64) -> bool {
     var k: f64[>..] = [];
     var tot: f64[>..] = [];
     k.resize(n, 0.0);
@@ -255,9 +301,9 @@ fn local_moving(n: i64, off: const i64[:], nbr: const i64[:], w: const f64[:], c
             }
             tot[c0] = tot[c0] - k[i];
             var best = c0;
-            var best_gain = wc[c0] - tot[c0] * k[i] / m2;
+            var best_gain = wc[c0] - gamma * tot[c0] * k[i] / m2;
             for c in touched {
-                let gain = wc[c] - tot[c] * k[i] / m2;
+                let gain = wc[c] - gamma * tot[c] * k[i] / m2;
                 if gain > best_gain + 1e-12 {
                     best = c;
                     best_gain = gain;
@@ -298,15 +344,27 @@ fn load_csr(db: i64, table: const u8[:], n: i64, off: i64[>..]&, nbr: i64[>..]&,
 // Louvain over the undirected file graph (imports and by-name calls,
 // weighted): local moving, then each community becomes one node, until
 // nothing moves. Deterministic: same repo, same communities.
-fn communities(db: i64) -> i64 {
+// gamma is Louvain's resolution: 1 is plain modularity; higher splits the
+// graph into more, smaller communities.
+fn communities(db: i64, gamma: f64) -> i64 {
     let n = scalar(db, "SELECT COUNT(*) FROM files");
+    // Tests are grouped with the code they exercise, not with each other:
+    // communities come from the code files alone, and each test file then
+    // joins the community it links to most.
     sqlite::exec_or_die(db, """
+        UPDATE files SET is_test = 1 WHERE
+            path LIKE 'tests/%' OR path LIKE 'test/%' OR path LIKE '%/tests/%' OR path LIKE '%/test/%'
+            OR path LIKE '%/__tests__/%' OR path LIKE '__tests__/%'
+            OR path GLOB '*/test_*.py' OR path GLOB 'test_*.py' OR path GLOB '*_test.py' OR path GLOB '*_tests.rs'
+            OR path GLOB '*.test.[jt]s' OR path GLOB '*.test.[jt]sx' OR path GLOB '*.spec.[jt]s' OR path GLOB '*.spec.[jt]sx'
+            OR path GLOB '*/conftest.py' OR path = 'conftest.py';
         UPDATE files SET community = id - 1;
         DROP TABLE IF EXISTS temp.g;
         CREATE TEMP TABLE g AS
             SELECT a - 1 AS a, b - 1 AS b, SUM(w) AS w FROM (
                 SELECT src AS a, dst AS b, weight AS w FROM file_edges
                 UNION ALL SELECT dst, src, weight FROM file_edges)
+            WHERE a IN (SELECT id FROM files WHERE is_test = 0) AND b IN (SELECT id FROM files WHERE is_test = 0)
             GROUP BY a, b;
     """);
     var member: i64[>..] = [];   // file index -> current community (a node of the current level)
@@ -320,7 +378,7 @@ fn communities(db: i64) -> i64 {
         load_csr(db, "temp.g", size, off, nbr, w);
         var comm: i64[>..] = [];
         for i in 0..size { comm.push(i); }
-        guard local_moving(size, off, nbr, w, comm) else { break; }
+        guard local_moving(size, off, nbr, w, comm, gamma) else { break; }
         levels++;
         // Renumber the communities 0..c-1 in node order.
         var renum: i64[>..] = [];
@@ -359,22 +417,40 @@ fn communities(db: i64) -> i64 {
         sqlite::step_done(up);
     }
     sqlite::finalize(up);
+    // Each test file joins the code community it links to most (imports
+    // and calls, either way); a test linked to no code shares one community
+    // of unlinked tests.
+    sqlite::exec_or_die(db, """
+        CREATE TEMP TABLE test_votes AS
+            SELECT t.id AS tid, c.community AS cm, SUM(e.w) AS w FROM (
+                SELECT src AS a, dst AS b, weight AS w FROM file_edges
+                UNION ALL SELECT dst, src, weight FROM file_edges) e
+            JOIN files t ON t.id = e.a AND t.is_test = 1
+            JOIN files c ON c.id = e.b AND c.is_test = 0
+            GROUP BY t.id, c.community;
+        UPDATE files SET community = COALESCE((
+            SELECT cm FROM test_votes v WHERE v.tid = files.id ORDER BY w DESC, cm LIMIT 1), -1)
+        WHERE is_test = 1;
+        DROP TABLE test_votes;
+    """);
     var rounds = levels;
-    // Number the communities by size and name each after its most common folder.
+    // Number the communities by their code files (unlinked tests last) and
+    // name each after its most linked code file.
     sqlite::exec_or_die(db, """
         DELETE FROM communities;
         CREATE TEMP TABLE ranked_c AS
-            SELECT community AS old, ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC, MIN(path)) AS new, COUNT(*) AS size
+            SELECT community AS old,
+                   ROW_NUMBER() OVER (ORDER BY community = -1, SUM(is_test = 0) DESC, COUNT(*) DESC, MIN(path)) AS new,
+                   SUM(is_test = 0) AS size, SUM(is_test = 1) AS tests
             FROM files GROUP BY community;
         UPDATE files SET community = (SELECT new FROM ranked_c WHERE old = files.community);
-        -- Named after its most linked file: "pitl-core/src/state.rs".
-        INSERT INTO communities (id, label, size)
-            SELECT r.new, (
+        INSERT INTO communities (id, label, size, tests)
+            SELECT r.new, CASE WHEN r.old = -1 THEN 'tests linked to no code' ELSE (
                 SELECT f.path FROM files f
                 LEFT JOIN (SELECT dst AS id, SUM(weight) AS w FROM file_edges GROUP BY dst) i ON i.id = f.id
                 LEFT JOIN (SELECT src AS id, SUM(weight) AS w FROM file_edges GROUP BY src) o ON o.id = f.id
                 WHERE f.community = r.new
-                ORDER BY COALESCE(i.w, 0) + COALESCE(o.w, 0) DESC, f.path LIMIT 1), r.size
+                ORDER BY f.is_test, COALESCE(i.w, 0) + COALESCE(o.w, 0) DESC, f.path LIMIT 1) END, r.size, r.tests
             FROM ranked_c r;
         DROP TABLE ranked_c;
     """);
