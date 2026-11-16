@@ -1,0 +1,4 @@
+// Spread-Wings' one native helper (lstat for the walk); SQLite and
+// tree-sitter come from the goose-sqlite and goose-treesitter packages.
+c_sources = ["../native/sw_sys.c"];
+output = "spread-wings";
