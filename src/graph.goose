@@ -197,10 +197,14 @@ fn link_imports(db: i64) -> i64 {
         } else if lang == "python" && names.len > 0 {
             each_split(names, ',') { n =>
                 if n.len > 0 {
+                    // `mod>x`: module mod bound as x.
+                    let gt = find(n, ">");
+                    let modname = if gt > 0 { n[..gt] } else { n };
+                    let bound = if gt > 0 { n[gt + 1..] } else { n };
                     var sub: u8[>..] = [];
-                    import_candidates(lang, path, str(module, if module.len > 0 && module[module.len - 1] == '.' { "" } else { "." }, n), sub);
+                    import_candidates(lang, path, str(module, if module.len > 0 && module[module.len - 1] == '.' { "" } else { "." }, modname), sub);
                     let mdst = first_file(find_st, like_st, sub);
-                    if mdst != 0 && mdst != src { add_alias(ins_alias, src, n, mdst); }
+                    if mdst != 0 && mdst != src && bound.len > 0 { add_alias(ins_alias, src, bound, mdst); }
                 }
             };
         } else if lang == "rust" && dst != 0 && names.len > 0 && find(names, ",") < 0 && find(module, "::{") < 0 {
@@ -267,14 +271,35 @@ fn link_calls(db: i64) {
                           AND (',' || i.names || ',') LIKE ('%,' || c.name || ',%'));
         INSERT OR IGNORE INTO done SELECT cid FROM chosen;
 
-        -- Imported from a file that only re-exports it: follow one hop.
+        -- Files that pass a name on (`from .base import f` in a module that
+        -- only re-exports f), up to three files deep: prov(file, name, sfile)
+        -- means importing name from file reaches sfile's definition.
+        CREATE TEMP TABLE pend AS SELECT DISTINCT name FROM cands WHERE cid NOT IN (SELECT cid FROM done);
+        CREATE TEMP TABLE prov AS SELECT d.sfile AS file_id, d.name AS name, d.sfile AS sfile, 0 AS hop
+            FROM defs d WHERE d.name IN (SELECT name FROM pend);
+        CREATE INDEX prov_file ON prov(file_id, name);
+        INSERT INTO prov SELECT DISTINCT i.file_id, p.name, p.sfile, 1 FROM prov p
+            JOIN imports i ON i.dst = p.file_id
+            WHERE p.hop = 0 AND i.file_id != p.sfile
+              AND (',' || i.names || ',') LIKE ('%,' || p.name || ',%')
+              AND NOT EXISTS (SELECT 1 FROM prov q WHERE q.file_id = i.file_id AND q.name = p.name AND q.sfile = p.sfile);
+        INSERT INTO prov SELECT DISTINCT i.file_id, p.name, p.sfile, 2 FROM prov p
+            JOIN imports i ON i.dst = p.file_id
+            WHERE p.hop = 1 AND i.file_id != p.sfile
+              AND (',' || i.names || ',') LIKE ('%,' || p.name || ',%')
+              AND NOT EXISTS (SELECT 1 FROM prov q WHERE q.file_id = i.file_id AND q.name = p.name AND q.sfile = p.sfile);
+        INSERT INTO prov SELECT DISTINCT i.file_id, p.name, p.sfile, 3 FROM prov p
+            JOIN imports i ON i.dst = p.file_id
+            WHERE p.hop = 2 AND i.file_id != p.sfile
+              AND (',' || i.names || ',') LIKE ('%,' || p.name || ',%')
+              AND NOT EXISTS (SELECT 1 FROM prov q WHERE q.file_id = i.file_id AND q.name = p.name AND q.sfile = p.sfile);
+
         INSERT INTO chosen
             SELECT c.cid, c.sid, 'imported_name' FROM cands c
             WHERE c.cid NOT IN (SELECT cid FROM done)
-              AND EXISTS (SELECT 1 FROM imports i JOIN imports j ON j.file_id = i.dst
-                          WHERE i.file_id = c.cfile AND j.dst = c.sfile
-                            AND (',' || i.names || ',') LIKE ('%,' || c.name || ',%')
-                            AND (',' || j.names || ',') LIKE ('%,' || c.name || ',%'));
+              AND EXISTS (SELECT 1 FROM imports i JOIN prov p ON p.file_id = i.dst AND p.name = c.name
+                          WHERE i.file_id = c.cfile AND p.sfile = c.sfile AND p.hop >= 1
+                            AND (',' || i.names || ',') LIKE ('%,' || c.name || ',%'));
         INSERT OR IGNORE INTO done SELECT cid FROM chosen;
 
         -- Called through a name bound to a module: `llm.f()` after
@@ -285,6 +310,16 @@ fn link_calls(db: i64) {
             WHERE c.cid NOT IN (SELECT cid FROM done)
               AND EXISTS (SELECT 1 FROM aliases a WHERE a.file_id = c.cfile AND a.dst = c.sfile
                           AND (k.text = a.alias || '.' || c.name OR k.text = a.alias || '::' || c.name));
+        INSERT OR IGNORE INTO done SELECT cid FROM chosen;
+
+        -- The same through a module that re-exports the name
+        -- (`extract._cpp_preprocess`, defined in extractors/fortran.py).
+        INSERT INTO chosen
+            SELECT c.cid, c.sid, 'module_alias' FROM cands c JOIN calls k ON k.rowid = c.cid
+            WHERE c.cid NOT IN (SELECT cid FROM done)
+              AND EXISTS (SELECT 1 FROM aliases a JOIN prov p ON p.file_id = a.dst AND p.name = c.name
+                          WHERE a.file_id = c.cfile AND p.sfile = c.sfile AND p.hop >= 1
+                            AND (k.text = a.alias || '.' || c.name OR k.text = a.alias || '::' || c.name));
         INSERT OR IGNORE INTO done SELECT cid FROM chosen;
 
         INSERT INTO chosen
@@ -328,6 +363,7 @@ fn link_calls(db: i64) {
             FROM chosen ch JOIN calls c ON c.rowid = ch.cid;
 
         DROP TABLE defs; DROP TABLE ndefs; DROP TABLE cands; DROP TABLE chosen; DROP TABLE done;
+        DROP TABLE pend; DROP TABLE prov;
     """);
     call_file_edges(db);
 }

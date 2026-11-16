@@ -49,8 +49,8 @@ spread-wings 0.1.0: a broad code graph from syntax alone
   spread-wings neighbors <graph.db> <path>
   spread-wings callers <graph.db> <name>
   spread-wings serve <graph.db>
-  spread-wings decide <graph.db> [--max N]   Span-02 decisions for calls still by_name
-                                            (OPENROUTER_API_KEY in the environment; default 5000 questions)
+  spread-wings decide <graph.db> [--max N] [--workers N]   Span-02 decisions for calls still by_name
+                                            (OPENROUTER_API_KEY in the environment; default 5000 questions, 32 parallel requests)
 """);
     exit(2);
 }
@@ -382,14 +382,18 @@ fn main() {
         return;
     }
     if cmd == "serve" && a.len == 3 { serve_main(a[2]); return; }
-    if cmd == "decide" && (a.len == 3 || (a.len == 5 && a[3] == "--max")) {
+    if cmd == "decide" {
         var maxq: i64 = 5000;
-        if a.len == 5 {
-            let m, ok = parse_int(a[4]);
-            guard ok && m > 0 else { abort("spread-wings: --max needs a positive number"); }
-            maxq = m;
+        var workers: i64 = 32;
+        var k = 3;
+        while k + 1 < a.len {
+            let v, ok = parse_int(a[k + 1]);
+            guard ok && v > 0 else { usage(); }
+            if a[k] == "--max" { maxq = v; } else if a[k] == "--workers" { workers = min(v, 128); } else { usage(); }
+            k = k + 2;
         }
-        decide_main(a[2], maxq);
+        guard k == a.len else { usage(); }
+        decide_main(a[2], maxq, workers);
         return;
     }
     let db = open_map(a[2]);

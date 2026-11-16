@@ -19,4 +19,8 @@
   exact; all 262 `build_from_json` calls resolve to one definition and agree
   with hosted Graphify's 198 shown callers.
 
-Not done: Span-02 decisions (0.2), more languages, incremental re-indexing.
+Built on branch `span-decisions`: Span-02 decisions (`decide`), rules learned
+from its answers, small windowed states (about a cent for a first run on
+Graphify's repo, answers cached by content).
+
+Not done: more languages, incremental re-indexing.

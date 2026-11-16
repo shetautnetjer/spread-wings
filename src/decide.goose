@@ -24,8 +24,7 @@ extern fn sw_http_post(url: const u8[:], key_env: const u8[:], body: const u8[:]
 let MODEL = "respan/span-02";
 let URL = "https://openrouter.ai/api/v1/systemone";
 let KEY_ENV = "OPENROUTER_API_KEY";
-let MAX_PER_REQUEST = 50;
-let MAX_STATE_LINES = 60;
+let MAX_PER_REQUEST = 8;    // questions per cluster of nearby calls (one small state each)
 let MIN_P = 600;    // thousandths: a choice below 0.6 changes nothing
 
 struct AskJob { idx: i64, body: u8[>..] }
@@ -49,29 +48,47 @@ thread_fn ask_worker() {
     }
 }
 
-// Lines [from, to] (1-based) of text, at most MAX_STATE_LINES, numbered
-// from 1 at `from`: a function that moves within its file (lines added
-// above it) reads exactly the same, so its cached answers still apply.
-fn lines_of(text: const u8[:], from: i64, to: i64, out: u8[>..]&) {
+// The function's first line, then the lines within WINDOW of any of
+// `rows` (file line numbers), numbered from 1 at `from`, with "..." where
+// lines are left out. Smaller than the whole function, and billed per
+// question.
+let WINDOW = 4;
+fn window_lines(text: const u8[:], from: i64, to: i64, rows: const i64[:], out: u8[>..]&) {
     var row: i64 = 0;
-    let last = min(to, from + MAX_STATE_LINES - 1);
+    var gap = false;
     each_split(text, '\n') { l =>
         row++;
-        if row >= from && row <= last { format(out, row - from + 1, ": ", l, "\n"); }
+        if row >= from && row <= to {
+            // The first line, and any import inside the function (tests often
+            // import what they call on their first lines): the clue the model
+            // needs most, at a few tokens.
+            let tl = trim(l);
+            var keep = row == from || starts_with(tl, "import ") || (starts_with(tl, "from ") && find(tl, " import ") > 0)
+                       || starts_with(tl, "use ");
+            for r in rows { if row >= r - WINDOW && row <= r + WINDOW { keep = true; } }
+            if keep { format(out, row - from + 1, ": ", l, "\n"); gap = false; }
+            else if !gap { out.append("...\n"); gap = true; }
+        }
     };
 }
 
+
 struct Site { file: i64, row: i64, callee: u8[..96], text: u8[..128] }
 
-fn decide_main(db_path: const u8[:], max_questions: i64) {
+fn decide_main(db_path: const u8[:], max_questions: i64, max_workers: i64) {
     let db = open_map(db_path);
     var err: u8[>..] = [];
     var root: u8[>..] = [];
     get_meta(db, "root", root);
-    var home: u8[>..] = [];
-    guard env("HOME", home) else { abort("spread-wings: HOME is not set"); }
+    // SPREAD_WINGS_CACHE picks another cache folder (a fresh one measures a
+    // first run without touching the real cache).
     var cache_dir: u8[>..] = [];
-    format(cache_dir, home, "/.cache/spread-wings");
+    if !env("SPREAD_WINGS_CACHE", cache_dir) || cache_dir.len == 0 {
+        var home: u8[>..] = [];
+        guard env("HOME", home) else { abort("spread-wings: HOME is not set"); }
+        cache_dir.clear();
+        format(cache_dir, home, "/.cache/spread-wings");
+    }
     sw_mkdirs(cache_dir);
     let cache = sqlite::open(str(cache_dir, "/decisions.db"), err);
     guard cache != 0 else { abort(str("spread-wings: cannot open the decision cache: ", err)); }
@@ -111,9 +128,17 @@ fn decide_main(db_path: const u8[:], max_questions: i64) {
     var in_req: i64 = 0;
     var text: u8[>..] = [];
     var state_from: i64 = 1;    // the file line that is line 1 of the state
+    var cluster_end: i64 = -1;  // the last call line the current state covers
     var state_imports: u8[>..] = [];
     var state_imports_file: i64 = -1;
     let imp_st = sqlite::prepare_or_die(db, "SELECT DISTINCT module FROM imports WHERE file_id = ?1 ORDER BY row");
+    let rows_st = sqlite::prepare_or_die(db, """
+        SELECT DISTINCT c.row FROM calls c
+        WHERE c.file_id = ?1 AND c.in_symbol = ?2 AND c.row >= ?3
+          AND EXISTS (SELECT 1 FROM call_edges e JOIN symbols t ON t.id = e.callee
+                      WHERE e.file_id = c.file_id AND e.row = c.row AND t.name = c.callee AND e.resolution = 'by_name')
+        ORDER BY c.row
+        """);
 
     fn flush_request() {
         guard in_req > 0;
@@ -144,9 +169,11 @@ fn decide_main(db_path: const u8[:], max_questions: i64) {
         sqlite::col_text(sites_st, 5, path);
         let s_row = sqlite::col_int(sites_st, 6);
         let s_end = sqlite::col_int(sites_st, 7);
-        // A new group (another function, or another file): a new state.
+        // A new state for another function or file, a call too far from the
+        // cluster's last one, or a full cluster: each question pays for its
+        // state, so a state covers only a few nearby calls.
         let group = fid * 1000000 + in_sym;
-        if group != cur_group || in_req >= MAX_PER_REQUEST {
+        if group != cur_group || in_req >= MAX_PER_REQUEST || row > cluster_end {
             flush_request();
             if fid != cur_file {
                 text.clear();
@@ -162,7 +189,7 @@ fn decide_main(db_path: const u8[:], max_questions: i64) {
                 sqlite::reset(imp_st);
                 sqlite::bind_int(imp_st, 1, fid);
                 var nimp = 0;
-                while sqlite::step(imp_st, err) == 1 && nimp < 40 {
+                while sqlite::step(imp_st, err) == 1 && nimp < 15 {
                     var m: u8[>..] = [];
                     sqlite::col_text(imp_st, 0, m);
                     format(state_imports, if nimp > 0 { ", " } else { "" }, m);
@@ -171,8 +198,22 @@ fn decide_main(db_path: const u8[:], max_questions: i64) {
                 state_imports_file = fid;
             }
             if state_imports.len > 0 { format(state, "Imports: ", state_imports, "\n"); }
-            if in_sym != 0 && s_row > 0 { state_from = s_row; lines_of(text, s_row, max(s_end, s_row), state); }
-            else { state_from = max(1, row - 15); lines_of(text, state_from, row + 15, state); }
+            // The lines of this function's ambiguous calls, for the windows.
+            // This cluster: the ambiguous calls from this one on, while each is
+            // within two windows of the previous and there are at most 8.
+            var rows: i64[>..] = [];
+            sqlite::reset(rows_st);
+            sqlite::bind_int(rows_st, 1, fid);
+            sqlite::bind_int(rows_st, 2, in_sym);
+            sqlite::bind_int(rows_st, 3, row);
+            while sqlite::step(rows_st, err) == 1 {
+                let r = sqlite::col_int(rows_st, 0);
+                if rows.len > 0 && (r - rows[rows.len - 1] > 2 * WINDOW + 1 || rows.len >= MAX_PER_REQUEST) { break; }
+                rows.push(r);
+            }
+            cluster_end = if rows.len > 0 { rows[rows.len - 1] } else { row };
+            if in_sym != 0 && s_row > 0 { state_from = s_row; window_lines(text, s_row, max(s_end, s_row), rows, state); }
+            else { state_from = 1; window_lines(text, 1, 1000000000, rows, state); }
             cur_group = group;
         }
         // The question: which definition does this call reach?
@@ -237,6 +278,7 @@ fn decide_main(db_path: const u8[:], max_questions: i64) {
     sqlite::finalize(sites_st);
     sqlite::finalize(cand_st);
     sqlite::finalize(imp_st);
+    sqlite::finalize(rows_st);
 
     // Ask, on worker threads.
     var results: u8[>..] = [];
@@ -257,7 +299,7 @@ fn decide_main(db_path: const u8[:], max_questions: i64) {
                 k++;
             }
         };
-        let workers = max(1, min(16, nreq));
+        let workers = max(1, min(max_workers, nreq));
         for w in 0..workers { qput(AskJob { idx: -1, .. }); }
         var tids: i64[>..] = [];
         for w in 0..workers { tids.push(thread_spawn(ask_worker)); }

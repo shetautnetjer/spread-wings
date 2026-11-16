@@ -87,15 +87,20 @@ still `by_name` after the import rules: a typed **choice** among the
 candidate definitions plus **outside** ("a library, a builtin or another
 type"), with a probability per option.
 
-- **State per function, questions per call.** The model bills the state
-  once *per question* (measured: 1, 10 and 100 questions on one state cost
-  1x, 10x and 100x the tokens), while a request with 100 questions takes
-  about as long as one with 1 (1.1 s). So the state is only the caller's own
-  function (at most 120 lines), and all of that function's ambiguous calls
-  go in one request (at most 50 questions).
-- **Parallel.** Requests run on worker threads (16), retrying 429 and 5xx
-  with backoff. The HTTP call is a small libcurl helper that reads the key
-  from the environment by name, so the key never enters the graph or logs.
+- **Small states, questions per call.** The model bills the state once
+  *per question* (measured: 1, 10 and 100 questions on one state cost 1x,
+  10x and 100x the tokens), while a request with 100 questions takes about
+  as long as one with 1 (1.1 s). So a state is a window, not a whole
+  function: the file's path and imports, the function's first line, any
+  import inside the function, and 4 lines around each ambiguous call. Calls
+  close together (at most 9 lines apart) share one state and one request,
+  at most 8 per request. Lines are numbered from the function's first line.
+  About 510 input tokens per question, down from about 1,000 for whole
+  functions.
+- **Parallel.** Requests run on 32 worker threads (`--workers N`, at most
+  128), retrying 429 and 5xx with backoff. The HTTP call is a small libcurl
+  helper that reads the key from the environment by name, so the key never
+  enters the graph or logs.
 - **Cached by content** (model + state + question) in
   `~/.cache/spread-wings/decisions.db`: an unchanged function is never asked
   again.
@@ -130,6 +135,7 @@ rule was checked against those cached answers before replacing them:
 |---|---|---|
 | `module_alias`: `llm.f()` after `from graphify import llm`, `import a.b as x`, `import * as x`, Rust `use crate::m;` | 894 links | 675 agree, 4 differ |
 | `imported_name` through one re-export (`from graphify.__main__ import install`, defined in `install.py`) | part of 9,761 | 690 agree, 26 differ |
+| `imported_name` through up to three re-exports (`_file_stem`: test → `extract.py` → `extractors/base.py` → `ids.py`) and `module_alias` through a re-export (`extract._cpp_preprocess`, defined in `extractors/fortran.py`), plus `from pkg import mod as x` | 295 more links | 4 differ, Span-02 wrong in all 4 |
 | `builtin_method`: a builtin method name (`get`, `items`, `join`, `resolve`, `push`, `unwrap`, ...) called on an object, with no candidate in a file the caller imports: not linked | 9,271 calls | 9,258 agree, 2 differ, 11 Span-02 unsure |
 
 Every difference sampled for the first two rules was Span-02 calling a
@@ -146,14 +152,21 @@ helps tell repo calls from library ones.
 
 | Run on Graphify's repo | Questions asked | Cost |
 |---|---|---|
-| First run, before the rules above | 13,712 | $0.157 |
-| First run, with them | 2,408 | $0.0177 |
-| After a one-line edit in one function | 24 | $0.00018 |
+| First run, whole-function states, before the rules above | 13,712 | $0.157 |
+| First run, whole-function states, with them | 2,408 | $0.0177 |
+| First run, small windowed states, all rules (fresh cache) | 2,249 | **$0.0106** (1.15 M tokens, 37 s on 32 workers) |
+| After a one-line edit in one function | ~24 | ~$0.0002 |
 | Unchanged | 0 | $0 |
 
-Next: send a few lines around each call instead of the whole function (a
-state is billed per question), and more parallel requests (asking is
-waiting on the network: 80 s for 1,513 requests on 16 threads).
+Answers from small states against the first whole-function run (2,494
+sites): 2,452 the same (2,214 asked again, 238 now settled by the new
+rules), 8 unsure, 8 different. Of the 8: four are re-exports the rules now
+follow (Span-02 had said "outside"), one is now right (`graph.query()` on a
+FalkorDB client, not a test helper), and three are calls through a local
+variable or a sample corpus file, where neither answer is exact.
+
+The cache folder can be moved with `SPREAD_WINGS_CACHE=<dir>`; an empty one
+measures a first run without touching the real cache.
 
 ## Further decision questions (planned)
 

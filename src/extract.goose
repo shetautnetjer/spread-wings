@@ -338,6 +338,12 @@ fn import_names(raw: const u8[:], out: u8[>..]&) {
         if n2.len > 0 && n2 != "*" && n2 != "self" && callee_name(n2) == n2 {
             if out.len > 0 { out.push(','); }
             out.append(n2);
+            // `from pkg import mod as x` also records `mod>x`, so the link
+            // step can bind x to pkg/mod.
+            if as_at > 0 {
+                let orig = trim(p[..as_at]);
+                if orig.len > 0 && callee_name(orig) == orig { format(out, ",", orig, ">", n2); }
+            }
         }
     };
 }
