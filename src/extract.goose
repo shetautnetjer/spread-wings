@@ -220,9 +220,9 @@ fn extract_repo(db: i64, repo: const u8[:]) -> i64 {
     }
     for t in tids { thread_wait(t); }
 
-    let ins_sym = sqlite::prepare_or_die(db, "INSERT INTO symbols (file_id, name, kind, row, start, end_) VALUES (?1, ?2, ?3, ?4, ?5, ?6)");
+    let ins_sym = sqlite::prepare_or_die(db, "INSERT INTO symbols (file_id, name, kind, row, start, end_, end_row, sig) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)");
     let ins_imp = sqlite::prepare_or_die(db, "INSERT INTO imports (file_id, module, row, names) VALUES (?1, ?2, ?3, ?4)");
-    let ins_call = sqlite::prepare_or_die(db, "INSERT INTO calls (file_id, row, start, callee, in_symbol) VALUES (?1, ?2, ?3, ?4, 0)");
+    let ins_call = sqlite::prepare_or_die(db, "INSERT INTO calls (file_id, row, start, callee, in_symbol, text) VALUES (?1, ?2, ?3, ?4, 0, ?5)");
     for i in 0..pids.len {
         let fid = pids[i];
         // Records: kind 0x1f a 0x1f b 0x1f start 0x1f end 0x1f row 0x1e
@@ -246,6 +246,7 @@ fn extract_repo(db: i64, repo: const u8[:]) -> i64 {
                 sqlite::bind_int(ins_call, 2, row);
                 sqlite::bind_int(ins_call, 3, st);
                 sqlite::bind_text(ins_call, 4, f[1]);
+                sqlite::bind_text(ins_call, 5, f[2]);
                 sqlite::step_done(ins_call);
             } else {
                 sqlite::reset(ins_sym);
@@ -255,6 +256,11 @@ fn extract_repo(db: i64, repo: const u8[:]) -> i64 {
                 sqlite::bind_int(ins_sym, 4, row);
                 sqlite::bind_int(ins_sym, 5, st);
                 sqlite::bind_int(ins_sym, 6, en);
+                // b is "<end row> <signature line>"
+                let sp = find(f[2], " ");
+                let er, er_ok = parse_int(if sp > 0 { f[2][..sp] } else { f[2] });
+                sqlite::bind_int(ins_sym, 7, if er_ok { er } else { row });
+                sqlite::bind_text(ins_sym, 8, if sp > 0 { f[2][sp + 1..] } else { "" });
                 sqlite::step_done(ins_sym);
             }
         };
@@ -267,6 +273,15 @@ fn extract_repo(db: i64, repo: const u8[:]) -> i64 {
     sqlite::exec_or_die(db, """
         DELETE FROM symbols WHERE id NOT IN (
             SELECT MIN(id) FROM symbols GROUP BY file_id, start, name);
+        -- A method's container: the innermost class, struct, trait, interface
+        -- or impl that spans it.
+        UPDATE symbols SET container = (
+            SELECT c.name FROM symbols c
+            WHERE c.file_id = symbols.file_id AND c.id != symbols.id
+              AND c.kind IN ('class', 'struct', 'trait', 'interface', 'impl')
+              AND c.start <= symbols.start AND symbols.end_ <= c.end_
+            ORDER BY c.end_ - c.start LIMIT 1)
+        WHERE kind = 'function';
         -- A call site sits in the innermost definition that spans it.
         UPDATE calls SET in_symbol = COALESCE((
             SELECT s.id FROM symbols s
@@ -323,6 +338,12 @@ fn import_names(raw: const u8[:], out: u8[>..]&) {
         if n2.len > 0 && n2 != "*" && n2 != "self" && callee_name(n2) == n2 {
             if out.len > 0 { out.push(','); }
             out.append(n2);
+            // `from pkg import mod as x` also records `mod>x`, so the link
+            // step can bind x to pkg/mod.
+            if as_at > 0 {
+                let orig = trim(p[..as_at]);
+                if orig.len > 0 && callee_name(orig) == orig { format(out, ",", orig, ">", n2); }
+            }
         }
     };
 }
@@ -369,20 +390,35 @@ thread_fn extract_worker() {
                                             };
                                         } else {
                                             if job.lang == "python" { import_names(after, names); }
+                                            if job.lang == "python" && imp_at < 0 {
+                                                // `import a.b as x`: the module a.b, bound to the name x.
+                                                let as_at = find(t, " as ");
+                                                if as_at > 0 {
+                                                    names.clear();
+                                                    names.push('@');
+                                                    names.append(trim(t[as_at + 4..]));
+                                                    record(done.data, "import", trim(t[..as_at]), names, st, en, row);
+                                                    names.clear();
+                                                    names.append("-");
+                                                }
+                                            }
                                             if job.lang == "rust" {
                                                 let brace = find(t, "::{");
                                                 if brace > 0 { import_names(t[brace + 3..], names); }
                                                 else { import_names(t, names); }
                                             }
                                             let m = module_name(text);
-                                            if m.len > 0 { record(done.data, "import", m, names, st, en, row); }
+                                            if m.len > 0 && names != "-" { record(done.data, "import", m, names, st, en, row); }
                                         }
                                     } else if f[0] == "call" {
                                         let c = callee_name(text);
-                                        if c.len > 0 { record(done.data, "call", c, "", st, en, row); }
+                                        if c.len > 0 { record(done.data, "call", c, one_line(text, 120), st, en, row); }
                                     } else {
                                         let name = callee_name(text);
-                                        if name.len > 0 { record(done.data, f[0], name, "", st, en, row); }
+                                        if name.len > 0 {
+                                            let end_row = row + count_newlines(treesitter::match_text(node));
+                                            record(done.data, f[0], name, str(end_row, " ", one_line(treesitter::match_text(node), 200)), st, en, row);
+                                        }
                                     }
                                 }
                             };
@@ -411,7 +447,8 @@ thread_fn extract_worker() {
                                     if head_end > 7 && starts_with(line, "import ") {
                                         var head = trim(line[7..head_end]);
                                         if starts_with(head, "type ") { head = trim(head[5..]); }
-                                        import_names(head, names);
+                                        if starts_with(head, "* as ") { names.push('@'); names.append(trim(head[5..])); }
+                                        else { import_names(head, names); }
                                     }
                                     record(done.data, "import", rest[1..1 + close], names, 0, 0, row);
                                 }
@@ -423,6 +460,22 @@ thread_fn extract_worker() {
         }
         qput(done);
     }
+}
+
+// The first line of s, at most n bytes, with no record separators.
+fn one_line(s: const u8[:], n: i64) -> u8[>..] {
+    var out: u8[>..] = [];
+    for c in s {
+        if c == '\n' || out.len >= n { break; }
+        out.push(if c == 0x1e || c == 0x1f || c == '\r' { ' ' } else { c });
+    }
+    return out;
+}
+
+fn count_newlines(s: const u8[:]) -> i64 {
+    var n: i64 = 0;
+    for c in s { if c == '\n' { n++; } }
+    return n;
 }
 
 fn only_dots(s: const u8[:]) -> bool {

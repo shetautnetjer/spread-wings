@@ -159,9 +159,18 @@ fn import_candidates(lang: const u8[:], importer: const u8[:], module: const u8[
     format(out, strip_ext(base), ".ts\n", strip_ext(base), ".tsx\n");   // `./m.js` written for `m.ts`
 }
 
+fn add_alias(st: i64, file: i64, alias: const u8[:], dst: i64) {
+    sqlite::reset(st);
+    sqlite::bind_int(st, 1, file);
+    sqlite::bind_text(st, 2, alias);
+    sqlite::bind_int(st, 3, dst);
+    sqlite::step_done(st);
+}
+
 fn link_imports(db: i64) -> i64 {
     var err: u8[>..] = [];
-    let q = sqlite::prepare_or_die(db, "SELECT i.file_id, f.path, f.lang, i.module, i.rowid FROM imports i JOIN files f ON f.id = i.file_id");
+    let q = sqlite::prepare_or_die(db, "SELECT i.file_id, f.path, f.lang, i.module, i.rowid, COALESCE(i.names, '') FROM imports i JOIN files f ON f.id = i.file_id");
+    let ins_alias = sqlite::prepare_or_die(db, "INSERT INTO aliases (file_id, alias, dst) VALUES (?1, ?2, ?3)");
     let set_dst = sqlite::prepare_or_die(db, "UPDATE imports SET dst = ?2 WHERE rowid = ?1");
     let find_st = sqlite::prepare_or_die(db, "SELECT id FROM files WHERE path = ?1");
     let like_st = sqlite::prepare_or_die(db, "SELECT id FROM files WHERE path LIKE ?1 ORDER BY length(path) LIMIT 1");
@@ -178,6 +187,32 @@ fn link_imports(db: i64) -> i64 {
         var cands: u8[>..] = [];
         import_candidates(lang, path, module, cands);
         let dst = first_file(find_st, like_st, cands);
+        var names: u8[>..] = [];
+        sqlite::col_text(q, 5, names);
+        // Names that stand for a whole module: `import a.b as x` and
+        // `import * as x` (marked '@'), `from pkg import mod` where pkg/mod is
+        // a module file, and Rust `use a::b;` where b is a module file.
+        if names.len > 1 && names[0] == '@' && dst != 0 {
+            add_alias(ins_alias, src, names[1..], dst);
+        } else if lang == "python" && names.len > 0 {
+            each_split(names, ',') { n =>
+                if n.len > 0 {
+                    // `mod>x`: module mod bound as x.
+                    let gt = find(n, ">");
+                    let modname = if gt > 0 { n[..gt] } else { n };
+                    let bound = if gt > 0 { n[gt + 1..] } else { n };
+                    var sub: u8[>..] = [];
+                    import_candidates(lang, path, str(module, if module.len > 0 && module[module.len - 1] == '.' { "" } else { "." }, modname), sub);
+                    let mdst = first_file(find_st, like_st, sub);
+                    if mdst != 0 && mdst != src && bound.len > 0 { add_alias(ins_alias, src, bound, mdst); }
+                }
+            };
+        } else if lang == "rust" && dst != 0 && names.len > 0 && find(names, ",") < 0 && find(module, "::{") < 0 {
+            // `use crate::state;` binds `state` when state is the file itself.
+            let last = rfind(module, "::");
+            let seg = if last >= 0 { module[last + 2..] } else { module };
+            if seg == names[..] { add_alias(ins_alias, src, names, dst); }
+        }
         if dst != 0 && dst != src {
             sqlite::reset(set_dst);
             sqlite::bind_int(set_dst, 1, sqlite::col_int(q, 4));
@@ -194,6 +229,7 @@ fn link_imports(db: i64) -> i64 {
     sqlite::finalize(find_st);
     sqlite::finalize(like_st);
     sqlite::finalize(set_dst);
+    sqlite::finalize(ins_alias);
     sqlite::finalize(ins);
     return n;
 }
@@ -235,11 +271,87 @@ fn link_calls(db: i64) {
                           AND (',' || i.names || ',') LIKE ('%,' || c.name || ',%'));
         INSERT OR IGNORE INTO done SELECT cid FROM chosen;
 
+        -- Files that pass a name on (`from .base import f` in a module that
+        -- only re-exports f), up to three files deep: prov(file, name, sfile)
+        -- means importing name from file reaches sfile's definition.
+        CREATE TEMP TABLE pend AS SELECT DISTINCT name FROM cands WHERE cid NOT IN (SELECT cid FROM done);
+        CREATE TEMP TABLE prov AS SELECT d.sfile AS file_id, d.name AS name, d.sfile AS sfile, 0 AS hop
+            FROM defs d WHERE d.name IN (SELECT name FROM pend);
+        CREATE INDEX prov_file ON prov(file_id, name);
+        INSERT INTO prov SELECT DISTINCT i.file_id, p.name, p.sfile, 1 FROM prov p
+            JOIN imports i ON i.dst = p.file_id
+            WHERE p.hop = 0 AND i.file_id != p.sfile
+              AND (',' || i.names || ',') LIKE ('%,' || p.name || ',%')
+              AND NOT EXISTS (SELECT 1 FROM prov q WHERE q.file_id = i.file_id AND q.name = p.name AND q.sfile = p.sfile);
+        INSERT INTO prov SELECT DISTINCT i.file_id, p.name, p.sfile, 2 FROM prov p
+            JOIN imports i ON i.dst = p.file_id
+            WHERE p.hop = 1 AND i.file_id != p.sfile
+              AND (',' || i.names || ',') LIKE ('%,' || p.name || ',%')
+              AND NOT EXISTS (SELECT 1 FROM prov q WHERE q.file_id = i.file_id AND q.name = p.name AND q.sfile = p.sfile);
+        INSERT INTO prov SELECT DISTINCT i.file_id, p.name, p.sfile, 3 FROM prov p
+            JOIN imports i ON i.dst = p.file_id
+            WHERE p.hop = 2 AND i.file_id != p.sfile
+              AND (',' || i.names || ',') LIKE ('%,' || p.name || ',%')
+              AND NOT EXISTS (SELECT 1 FROM prov q WHERE q.file_id = i.file_id AND q.name = p.name AND q.sfile = p.sfile);
+
+        INSERT INTO chosen
+            SELECT c.cid, c.sid, 'imported_name' FROM cands c
+            WHERE c.cid NOT IN (SELECT cid FROM done)
+              AND EXISTS (SELECT 1 FROM imports i JOIN prov p ON p.file_id = i.dst AND p.name = c.name
+                          WHERE i.file_id = c.cfile AND p.sfile = c.sfile AND p.hop >= 1
+                            AND (',' || i.names || ',') LIKE ('%,' || c.name || ',%'));
+        INSERT OR IGNORE INTO done SELECT cid FROM chosen;
+
+        -- Called through a name bound to a module: `llm.f()` after
+        -- `from graphify import llm`, `x.f()` after `import a.b as x`,
+        -- `state::f()` after `use crate::state;`.
+        INSERT INTO chosen
+            SELECT c.cid, c.sid, 'module_alias' FROM cands c JOIN calls k ON k.rowid = c.cid
+            WHERE c.cid NOT IN (SELECT cid FROM done)
+              AND EXISTS (SELECT 1 FROM aliases a WHERE a.file_id = c.cfile AND a.dst = c.sfile
+                          AND (k.text = a.alias || '.' || c.name OR k.text = a.alias || '::' || c.name));
+        INSERT OR IGNORE INTO done SELECT cid FROM chosen;
+
+        -- The same through a module that re-exports the name
+        -- (`extract._cpp_preprocess`, defined in extractors/fortran.py).
+        INSERT INTO chosen
+            SELECT c.cid, c.sid, 'module_alias' FROM cands c JOIN calls k ON k.rowid = c.cid
+            WHERE c.cid NOT IN (SELECT cid FROM done)
+              AND EXISTS (SELECT 1 FROM aliases a JOIN prov p ON p.file_id = a.dst AND p.name = c.name
+                          WHERE a.file_id = c.cfile AND p.sfile = c.sfile AND p.hop >= 1
+                            AND (k.text = a.alias || '.' || c.name OR k.text = a.alias || '::' || c.name));
+        INSERT OR IGNORE INTO done SELECT cid FROM chosen;
+
         INSERT INTO chosen
             SELECT c.cid, c.sid, 'imported_file' FROM cands c
             WHERE c.cid NOT IN (SELECT cid FROM done)
               AND EXISTS (SELECT 1 FROM imports i WHERE i.file_id = c.cfile AND i.dst = c.sfile);
         INSERT OR IGNORE INTO done SELECT cid FROM chosen;
+
+        -- A builtin method name (dict.get, list.append, str.join, Path.resolve,
+        -- Array.push, Option.unwrap, ...) called on an object, when no
+        -- candidate definition is in a file the caller imports: a library or
+        -- builtin call, not this repo's. Recorded on the call, not linked.
+        -- (Checked against Span-02's answers on Graphify's repo; see
+        -- docs/DESIGN.md.)
+        UPDATE calls SET note = 'builtin_method'
+        WHERE rowid IN (SELECT cid FROM cands)
+          AND rowid NOT IN (SELECT cid FROM done)
+          AND (instr(COALESCE(text, ''), '.') > 0 OR instr(COALESCE(text, ''), '::') > 0)
+          AND callee IN ('get', 'set', 'items', 'keys', 'values', 'add', 'append', 'extend', 'insert',
+                         'pop', 'remove', 'update', 'clear', 'copy', 'join', 'split', 'strip', 'replace',
+                         'format', 'startswith', 'endswith', 'lower', 'upper', 'encode', 'decode', 'read',
+                         'write', 'close', 'open', 'resolve', 'exists', 'unlink', 'mkdir', 'glob', 'iterdir',
+                         'read_text', 'write_text', 'push', 'map', 'filter', 'forEach', 'reduce', 'find',
+                         'includes', 'has', 'delete', 'then', 'catch', 'slice', 'splice', 'toString',
+                         'unwrap', 'expect', 'clone', 'iter', 'collect', 'len', 'is_empty', 'contains',
+                         'to_string', 'as_str', 'into', 'from', 'next', 'sort', 'reverse', 'count', 'index',
+                         'match', 'search', 'sub', 'group', 'patch', 'assert_called_once', 'assert_called_with')
+          AND NOT EXISTS (SELECT 1 FROM cands k JOIN imports i ON i.file_id = k.cfile AND i.dst = k.sfile
+                          WHERE k.cid = calls.rowid)
+          AND NOT EXISTS (SELECT 1 FROM cands k JOIN aliases a ON a.file_id = k.cfile AND a.dst = k.sfile
+                          WHERE k.cid = calls.rowid);
+        INSERT OR IGNORE INTO done SELECT rowid FROM calls WHERE note = 'builtin_method';
 
         INSERT INTO chosen
             SELECT c.cid, c.sid, 'by_name' FROM cands c
@@ -250,6 +362,15 @@ fn link_calls(db: i64) {
                    1.0 / COUNT(*) OVER (PARTITION BY ch.cid), 1, ch.resolution
             FROM chosen ch JOIN calls c ON c.rowid = ch.cid;
 
+        DROP TABLE defs; DROP TABLE ndefs; DROP TABLE cands; DROP TABLE chosen; DROP TABLE done;
+        DROP TABLE pend; DROP TABLE prov;
+    """);
+    call_file_edges(db);
+}
+
+// File links from call links.
+fn call_file_edges(db: i64) {
+    sqlite::exec_or_die(db, """
         -- File links from calls count for less than an import: weight 0.3,
         -- and by_name links only for names defined in at most 3 files, so
         -- generic names (`new`, `parse`) don't tie unrelated files together.
@@ -258,9 +379,8 @@ fn link_calls(db: i64) {
             FROM call_edges e JOIN symbols s ON s.id = e.callee
             WHERE s.file_id != e.file_id
               AND (e.resolution != 'by_name'
-                   OR (SELECT COUNT(DISTINCT d.sfile) FROM defs d WHERE d.name = s.name) <= 3)
+                   OR (SELECT COUNT(DISTINCT d.file_id) FROM symbols d WHERE d.name = s.name AND d.kind IN ('function', 'class', 'struct', 'enum', 'trait', 'interface')) <= 3)
             GROUP BY e.file_id, s.file_id;
-        DROP TABLE defs; DROP TABLE ndefs; DROP TABLE cands; DROP TABLE chosen; DROP TABLE done;
     """);
 }
 
@@ -334,7 +454,7 @@ fn load_csr(db: i64, table: const u8[:], n: i64, off: i64[>..]&, nbr: i64[>..]&,
         let a = sqlite::col_int(st, 0);
         row_a.push(a);
         nbr.push(sqlite::col_int(st, 1));
-        w.push(sqlite::col_int(st, 2) as f64 / 1000.0);
+        w.push(sqlite::col_int(st, 2) / 1000.0);
     }
     sqlite::finalize(st);
     for a in row_a { off[a + 1] = off[a + 1] + 1; }

@@ -14,20 +14,27 @@ CREATE TABLE IF NOT EXISTS files (
     community INTEGER, is_test INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS symbols (
     id INTEGER PRIMARY KEY, file_id INTEGER, name TEXT, kind TEXT,
-    row INTEGER, start INTEGER, end_ INTEGER);
+    row INTEGER, start INTEGER, end_ INTEGER, end_row INTEGER, sig TEXT, container TEXT);
 CREATE TABLE IF NOT EXISTS imports (file_id INTEGER, module TEXT, row INTEGER, names TEXT, dst INTEGER);
 CREATE TABLE IF NOT EXISTS calls (
-    file_id INTEGER, row INTEGER, start INTEGER, callee TEXT, in_symbol INTEGER);
+    file_id INTEGER, row INTEGER, start INTEGER, callee TEXT, in_symbol INTEGER, text TEXT,
+    note TEXT);
+CREATE TABLE IF NOT EXISTS aliases (file_id INTEGER, alias TEXT, dst INTEGER);
 CREATE TABLE IF NOT EXISTS file_edges (src INTEGER, dst INTEGER, kind TEXT, weight REAL);
 CREATE TABLE IF NOT EXISTS call_edges (
     caller INTEGER, callee INTEGER, file_id INTEGER, row INTEGER, weight REAL, by_name INTEGER,
     resolution TEXT);
+CREATE TABLE IF NOT EXISTS decisions (
+    file_id INTEGER, row INTEGER, callee TEXT, choice TEXT, target INTEGER, p INTEGER);
 CREATE TABLE IF NOT EXISTS communities (id INTEGER PRIMARY KEY, label TEXT, size INTEGER, tests INTEGER);
 CREATE INDEX IF NOT EXISTS symbols_name ON symbols(name);
 CREATE INDEX IF NOT EXISTS symbols_file ON symbols(file_id);
 CREATE INDEX IF NOT EXISTS calls_callee ON calls(callee);
 CREATE INDEX IF NOT EXISTS calls_file ON calls(file_id);
 CREATE INDEX IF NOT EXISTS file_edges_src ON file_edges(src);
+CREATE INDEX IF NOT EXISTS imports_file ON imports(file_id, dst);
+CREATE INDEX IF NOT EXISTS aliases_file ON aliases(file_id, dst);
+CREATE INDEX IF NOT EXISTS calls_site ON calls(file_id, row);
 CREATE INDEX IF NOT EXISTS file_edges_dst ON file_edges(dst);
 """;
 

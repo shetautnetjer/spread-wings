@@ -18,6 +18,7 @@ import treesitter from "shetautnetjer/goose-treesitter@59313e9da0b9f1cce8df83cab
 import .store;
 import .extract;
 import .graph;
+import .decide;
 
 let VERSION = "0.1.0";
 
@@ -31,7 +32,7 @@ fn parse_decimal(s: const u8[:]) -> f64, bool {
         var scale = 0.1;
         for c in s[dot + 1..] {
             guard c >= '0' && c <= '9' else { return 0.0, false; }
-            v = v + ((c - '0') as f64) * scale;
+            v = v + (c - '0') * scale;
             scale = scale / 10.0;
         }
     }
@@ -48,6 +49,8 @@ spread-wings 0.1.0: a broad code graph from syntax alone
   spread-wings neighbors <graph.db> <path>
   spread-wings callers <graph.db> <name>
   spread-wings serve <graph.db>
+  spread-wings decide <graph.db> [--max N] [--workers N]   Span-02 decisions for calls still by_name
+                                            (OPENROUTER_API_KEY in the environment; default 5000 questions, 32 parallel requests)
 """);
     exit(2);
 }
@@ -379,6 +382,20 @@ fn main() {
         return;
     }
     if cmd == "serve" && a.len == 3 { serve_main(a[2]); return; }
+    if cmd == "decide" {
+        var maxq: i64 = 5000;
+        var workers: i64 = 32;
+        var k = 3;
+        while k + 1 < a.len {
+            let v, ok = parse_int(a[k + 1]);
+            guard ok && v > 0 else { usage(); }
+            if a[k] == "--max" { maxq = v; } else if a[k] == "--workers" { workers = min(v, 128); } else { usage(); }
+            k = k + 2;
+        }
+        guard k == a.len else { usage(); }
+        decide_main(a[2], maxq, workers);
+        return;
+    }
     let db = open_map(a[2]);
     var out: u8[>..] = [];
     var ok = true;

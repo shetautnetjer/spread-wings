@@ -40,10 +40,14 @@ rebuilt to be fast, local and honest about what it knows.
   with no human approval.
 - **Says what kind of fact each answer is.** Every link is marked as matched
   by name or by path. Nothing is invented by a model in 0.1.
-- **No LLM needed.** The graph comes from tree-sitter parses and graph
-  algorithms. A cheap decision model (Span-02) is planned for 0.2, to answer
-  typed questions with probabilities, never to write free text (see
-  [the design](docs/DESIGN.md)).
+- **No LLM needed, one cheap one optional.** The graph comes from tree-sitter
+  parses and graph algorithms. `spread-wings decide` then asks Span-02, a
+  decision model, typed questions about the calls the code alone can't tie
+  down: which candidate definition, or "outside this repo", with
+  probabilities, never free text. Rules learned from its answers settle most
+  calls first; on Graphify's repo a first run costs about a cent ($0.011), a
+  re-index after a one-line edit $0.0002, and an unchanged one nothing (answers are cached
+  by content; see [the design](docs/DESIGN.md)).
 
 ## What it builds
 
@@ -76,6 +80,7 @@ bin/spread-wings find myrepo.db parse_config
 bin/spread-wings neighbors myrepo.db src/config.py
 bin/spread-wings callers myrepo.db parse_config
 bin/spread-wings serve myrepo.db      # the same four tools over MCP (stdio)
+OPENROUTER_API_KEY=... bin/spread-wings decide myrepo.db   # optional: Span-02 decisions for calls still by_name
 ```
 
 Register it with Claude Code:
@@ -92,9 +97,8 @@ All output is JSON.
   PHP, Lua, GDScript, shaders); their patterns come next.
 - Patterns match fixed shapes, so unusual definitions can be missed (for
   example a Python function inside a decorator factory's return).
-- Method calls on objects (`x.get()`) need type information, so most stay
-  `by_name` (on Graphify's repo, 51,158 of 78,761 links). That's what the
-  0.2 decision step is for.
+- Without `decide`, method calls on objects whose type the imports don't
+  reveal stay `by_name`.
 
 ## Documents
 

@@ -78,7 +78,97 @@ Every fact is one of:
 Tools say which. Nothing is compiler-resolved, and in 0.1 nothing comes from
 a model.
 
-## 0.2: decisions with Span-02
+## Decisions with Span-02 (built)
+
+`spread-wings decide <graph.db> [--max N]` asks
+[Span-02](https://www.respan.ai/models/span-02) (`respan/span-02`, through
+OpenRouter's System One endpoint, `/api/v1/systemone`) about every call
+still `by_name` after the import rules: a typed **choice** among the
+candidate definitions plus **outside** ("a library, a builtin or another
+type"), with a probability per option.
+
+- **Small states, questions per call.** The model bills the state once
+  *per question* (measured: 1, 10 and 100 questions on one state cost 1x,
+  10x and 100x the tokens), while a request with 100 questions takes about
+  as long as one with 1 (1.1 s). So a state is a window, not a whole
+  function: the file's path and imports, the function's first line, any
+  import inside the function, and 4 lines around each ambiguous call. Calls
+  close together (at most 9 lines apart) share one state and one request,
+  at most 8 per request. Lines are numbered from the function's first line.
+  About 510 input tokens per question, down from about 1,000 for whole
+  functions.
+- **Parallel.** Requests run on 32 worker threads (`--workers N`, at most
+  128), retrying 429 and 5xx with backoff. The HTTP call is a small libcurl
+  helper that reads the key from the environment by name, so the key never
+  enters the graph or logs.
+- **Cached by content** (model + state + question) in
+  `~/.cache/spread-wings/decisions.db`: an unchanged function is never asked
+  again.
+- **Applied conservatively.** A definition chosen with p >= 0.6 becomes the
+  call's only link (`resolution = decided`, weight p). "Outside" with
+  p >= 0.6 removes the guessed links. Anything less certain stays `by_name`.
+  File links and communities are then recomputed.
+
+Measured on Graphify's repo (`52cb282`): 13,712 questions in 5,122
+requests, none failed, **$0.157** in total, 206 s of waiting on the network.
+
+- 11,980 calls were **outside** the repo: `dict.get`, `set()`, `set.add`,
+  `Path.resolve`, `mock.patch`, networkx's `G.edges`. Each had been linked
+  by name to a same-named repo method (httpx's `Client.get`, `Cookies.set`),
+  so these were false edges, now removed.
+- 1,631 calls were tied to **one repo definition**, mostly calls through
+  module aliases (`llm.extract_files_direct`, `sc.sanitize_semantic_fragment`,
+  `mainmod.main`, where `main` is defined 73 times). All 14 sampled were
+  right.
+- 101 stayed `by_name` (p < 0.6).
+- One sampled mistake: a name imported from a module that only re-exports
+  it (`from graphify.extract import _make_id`, defined in
+  `extractors/base.py`) was called "outside" at p = 0.64. Following
+  re-exports is a deterministic fix for the import rules.
+
+### Rules learned from the answers
+
+Span-02's answers showed where deterministic rules were missing, and each
+rule was checked against those cached answers before replacing them:
+
+| Rule | Settles | Agreement with Span-02 |
+|---|---|---|
+| `module_alias`: `llm.f()` after `from graphify import llm`, `import a.b as x`, `import * as x`, Rust `use crate::m;` | 894 links | 675 agree, 4 differ |
+| `imported_name` through one re-export (`from graphify.__main__ import install`, defined in `install.py`) | part of 9,761 | 690 agree, 26 differ |
+| `imported_name` through up to three re-exports (`_file_stem`: test → `extract.py` → `extractors/base.py` → `ids.py`) and `module_alias` through a re-export (`extract._cpp_preprocess`, defined in `extractors/fortran.py`), plus `from pkg import mod as x` | 295 more links | 4 differ, Span-02 wrong in all 4 |
+| `builtin_method`: a builtin method name (`get`, `items`, `join`, `resolve`, `push`, `unwrap`, ...) called on an object, with no candidate in a file the caller imports: not linked | 9,271 calls | 9,258 agree, 2 differ, 11 Span-02 unsure |
+
+Every difference sampled for the first two rules was Span-02 calling a
+re-exported or aliased repo function "outside"; the rule was right. With
+these rules, by-name call links on Graphify's repo dropped from 78,761 to
+33,007 and the questions needed from 12,816 to 2,489.
+
+### What it costs
+
+The state is numbered from the function's first line, not the file's, so a
+function that only moved (lines added above it) reads exactly the same and
+keeps its cached answers. The state also lists the file's imports, which
+helps tell repo calls from library ones.
+
+| Run on Graphify's repo | Questions asked | Cost |
+|---|---|---|
+| First run, whole-function states, before the rules above | 13,712 | $0.157 |
+| First run, whole-function states, with them | 2,408 | $0.0177 |
+| First run, small windowed states, all rules (fresh cache) | 2,249 | **$0.0106** (1.15 M tokens, 37 s on 32 workers) |
+| After a one-line edit in one function | ~24 | ~$0.0002 |
+| Unchanged | 0 | $0 |
+
+Answers from small states against the first whole-function run (2,494
+sites): 2,452 the same (2,214 asked again, 238 now settled by the new
+rules), 8 unsure, 8 different. Of the 8: four are re-exports the rules now
+follow (Span-02 had said "outside"), one is now right (`graph.query()` on a
+FalkorDB client, not a test helper), and three are calls through a local
+variable or a sample corpus file, where neither answer is exact.
+
+The cache folder can be moved with `SPREAD_WINGS_CACHE=<dir>`; an empty one
+measures a first run without touching the real cache.
+
+## Further decision questions (planned)
 
 [Span-02](https://www.respan.ai/models/span-02) (Respan, through OpenRouter as
 `respan/span-02`) is a decision model: it answers typed questions (a choice,
