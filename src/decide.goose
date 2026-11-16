@@ -25,7 +25,7 @@ let MODEL = "respan/span-02";
 let URL = "https://openrouter.ai/api/v1/systemone";
 let KEY_ENV = "OPENROUTER_API_KEY";
 let MAX_PER_REQUEST = 50;
-let MAX_STATE_LINES = 120;
+let MAX_STATE_LINES = 60;
 let MIN_P = 600;    // thousandths: a choice below 0.6 changes nothing
 
 struct AskJob { idx: i64, body: u8[>..] }
@@ -49,13 +49,15 @@ thread_fn ask_worker() {
     }
 }
 
-// Lines [from, to] (1-based) of text, at most MAX_STATE_LINES.
+// Lines [from, to] (1-based) of text, at most MAX_STATE_LINES, numbered
+// from 1 at `from`: a function that moves within its file (lines added
+// above it) reads exactly the same, so its cached answers still apply.
 fn lines_of(text: const u8[:], from: i64, to: i64, out: u8[>..]&) {
     var row: i64 = 0;
     let last = min(to, from + MAX_STATE_LINES - 1);
     each_split(text, '\n') { l =>
         row++;
-        if row >= from && row <= last { format(out, row, ": ", l, "\n"); }
+        if row >= from && row <= last { format(out, row - from + 1, ": ", l, "\n"); }
     };
 }
 
@@ -108,6 +110,10 @@ fn decide_main(db_path: const u8[:], max_questions: i64) {
     var questions: u8[>..] = [];
     var in_req: i64 = 0;
     var text: u8[>..] = [];
+    var state_from: i64 = 1;    // the file line that is line 1 of the state
+    var state_imports: u8[>..] = [];
+    var state_imports_file: i64 = -1;
+    let imp_st = sqlite::prepare_or_die(db, "SELECT DISTINCT module FROM imports WHERE file_id = ?1 ORDER BY row");
 
     fn flush_request() {
         guard in_req > 0;
@@ -148,9 +154,25 @@ fn decide_main(db_path: const u8[:], max_questions: i64) {
                 cur_file = fid;
             }
             state.clear();
+            // The file's path and its imports help tell a repo call from a
+            // library one; the code is the caller's own function.
             format(state, "File: ", path, "\n");
-            if in_sym != 0 && s_row > 0 { lines_of(text, s_row, max(s_end, s_row), state); }
-            else { lines_of(text, max(1, row - 15), row + 15, state); }
+            if fid != state_imports_file {
+                state_imports.clear();
+                sqlite::reset(imp_st);
+                sqlite::bind_int(imp_st, 1, fid);
+                var nimp = 0;
+                while sqlite::step(imp_st, err) == 1 && nimp < 40 {
+                    var m: u8[>..] = [];
+                    sqlite::col_text(imp_st, 0, m);
+                    format(state_imports, if nimp > 0 { ", " } else { "" }, m);
+                    nimp++;
+                }
+                state_imports_file = fid;
+            }
+            if state_imports.len > 0 { format(state, "Imports: ", state_imports, "\n"); }
+            if in_sym != 0 && s_row > 0 { state_from = s_row; lines_of(text, s_row, max(s_end, s_row), state); }
+            else { state_from = max(1, row - 15); lines_of(text, state_from, row + 15, state); }
             cur_group = group;
         }
         // The question: which definition does this call reach?
@@ -181,7 +203,7 @@ fn decide_main(db_path: const u8[:], max_questions: i64) {
         json::format_string(crit, "none of these: a function or method from a library, the language's builtins (for example dict.get, list.append, str.join) or another type not listed");
         var q: u8[>..] = [];
         q.append("{\"type\":\"choice\",\"instructions\":");
-        json::format_string(q, str("On line ", row, ", the call `", ctext, "(...)` uses the name ", callee, ". Which definition does it call?"));
+        json::format_string(q, str("On line ", row - state_from + 1, ", the call `", ctext, "(...)` uses the name ", callee, ". Which definition does it call?"));
         q.append(",\"criteria\":{");
         q.append(crit);
         q.append("}}");
@@ -214,6 +236,7 @@ fn decide_main(db_path: const u8[:], max_questions: i64) {
     flush_request();
     sqlite::finalize(sites_st);
     sqlite::finalize(cand_st);
+    sqlite::finalize(imp_st);
 
     // Ask, on worker threads.
     var results: u8[>..] = [];

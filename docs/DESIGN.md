@@ -121,10 +121,39 @@ requests, none failed, **$0.157** in total, 206 s of waiting on the network.
   `extractors/base.py`) was called "outside" at p = 0.64. Following
   re-exports is a deterministic fix for the import rules.
 
-Next, before more model use: follow re-exports one hop, and resolve calls
-through module aliases (`import a.b as x; x.f()`, `from pkg import mod;
-mod.f()`) in the import rules, which would settle most of the 1,631 without
-asking; then more parallel requests (the wait is network, not CPU).
+### Rules learned from the answers
+
+Span-02's answers showed where deterministic rules were missing, and each
+rule was checked against those cached answers before replacing them:
+
+| Rule | Settles | Agreement with Span-02 |
+|---|---|---|
+| `module_alias`: `llm.f()` after `from graphify import llm`, `import a.b as x`, `import * as x`, Rust `use crate::m;` | 894 links | 675 agree, 4 differ |
+| `imported_name` through one re-export (`from graphify.__main__ import install`, defined in `install.py`) | part of 9,761 | 690 agree, 26 differ |
+| `builtin_method`: a builtin method name (`get`, `items`, `join`, `resolve`, `push`, `unwrap`, ...) called on an object, with no candidate in a file the caller imports: not linked | 9,271 calls | 9,258 agree, 2 differ, 11 Span-02 unsure |
+
+Every difference sampled for the first two rules was Span-02 calling a
+re-exported or aliased repo function "outside"; the rule was right. With
+these rules, by-name call links on Graphify's repo dropped from 78,761 to
+33,007 and the questions needed from 12,816 to 2,489.
+
+### What it costs
+
+The state is numbered from the function's first line, not the file's, so a
+function that only moved (lines added above it) reads exactly the same and
+keeps its cached answers. The state also lists the file's imports, which
+helps tell repo calls from library ones.
+
+| Run on Graphify's repo | Questions asked | Cost |
+|---|---|---|
+| First run, before the rules above | 13,712 | $0.157 |
+| First run, with them | 2,408 | $0.0177 |
+| After a one-line edit in one function | 24 | $0.00018 |
+| Unchanged | 0 | $0 |
+
+Next: send a few lines around each call instead of the whole function (a
+state is billed per question), and more parallel requests (asking is
+waiting on the network: 80 s for 1,513 requests on 16 threads).
 
 ## Further decision questions (planned)
 

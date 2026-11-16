@@ -44,9 +44,10 @@ rebuilt to be fast, local and honest about what it knows.
   parses and graph algorithms. `spread-wings decide` then asks Span-02, a
   decision model, typed questions about the calls the code alone can't tie
   down: which candidate definition, or "outside this repo", with
-  probabilities, never free text. On Graphify's repo it removed 11,980 false
-  links (`dict.get` linked to httpx's `Client.get`) and tied 1,631 calls to
-  one definition, for $0.16 (see [the design](docs/DESIGN.md)).
+  probabilities, never free text. Rules learned from its answers settle most
+  calls first; on Graphify's repo a first run costs $0.018, a re-index after
+  a one-line edit $0.0002, and an unchanged one nothing (answers are cached
+  by content; see [the design](docs/DESIGN.md)).
 
 ## What it builds
 
@@ -96,9 +97,8 @@ All output is JSON.
   PHP, Lua, GDScript, shaders); their patterns come next.
 - Patterns match fixed shapes, so unusual definitions can be missed (for
   example a Python function inside a decorator factory's return).
-- Without `decide`, method calls on objects (`x.get()`) stay `by_name`.
-  Calls through module aliases and re-exported names aren't resolved by the
-  import rules yet (`decide` handles most of them).
+- Without `decide`, method calls on objects whose type the imports don't
+  reveal stay `by_name`.
 
 ## Documents
 

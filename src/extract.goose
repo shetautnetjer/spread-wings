@@ -384,13 +384,25 @@ thread_fn extract_worker() {
                                             };
                                         } else {
                                             if job.lang == "python" { import_names(after, names); }
+                                            if job.lang == "python" && imp_at < 0 {
+                                                // `import a.b as x`: the module a.b, bound to the name x.
+                                                let as_at = find(t, " as ");
+                                                if as_at > 0 {
+                                                    names.clear();
+                                                    names.push('@');
+                                                    names.append(trim(t[as_at + 4..]));
+                                                    record(done.data, "import", trim(t[..as_at]), names, st, en, row);
+                                                    names.clear();
+                                                    names.append("-");
+                                                }
+                                            }
                                             if job.lang == "rust" {
                                                 let brace = find(t, "::{");
                                                 if brace > 0 { import_names(t[brace + 3..], names); }
                                                 else { import_names(t, names); }
                                             }
                                             let m = module_name(text);
-                                            if m.len > 0 { record(done.data, "import", m, names, st, en, row); }
+                                            if m.len > 0 && names != "-" { record(done.data, "import", m, names, st, en, row); }
                                         }
                                     } else if f[0] == "call" {
                                         let c = callee_name(text);
@@ -429,7 +441,8 @@ thread_fn extract_worker() {
                                     if head_end > 7 && starts_with(line, "import ") {
                                         var head = trim(line[7..head_end]);
                                         if starts_with(head, "type ") { head = trim(head[5..]); }
-                                        import_names(head, names);
+                                        if starts_with(head, "* as ") { names.push('@'); names.append(trim(head[5..])); }
+                                        else { import_names(head, names); }
                                     }
                                     record(done.data, "import", rest[1..1 + close], names, 0, 0, row);
                                 }
