@@ -176,6 +176,24 @@ test client from a fixture. That is the boundary of syntax-only rules; the
 answer past it is a compiler-level map (Swan's SCIP indexes), not more
 rules.
 
+### Compiler answers from Swan (built)
+
+`spread-wings compiler <graph.db> <swan.db>` reads a Swan map (read only).
+For each call still tied only by name, it looks at the compiler's
+resolution of that name on the same line: all outside the repo removes the
+guessed links; exactly one repo definition becomes the only link
+(`resolution = compiler`, weight 1). Anything else stays for `decide`. Run
+it before `decide`, so the model is only asked what the compiler can't say.
+
+| Repo | By-name calls | Swan covers | Tied to one definition | Outside |
+|---|---|---|---|---|
+| PITL (Rust, TS) | 118 | 110 | 61 | 49 |
+| Graphify (Python), after all rules | 351 | 120 | 0 | 106 (all 118 Span-02 had answered agree) |
+
+On Graphify the rest is what Pyright can't type either (`G` passed in
+untyped, test-client fixtures). A first `decide` run after `compiler` asks
+246 questions for **$0.0014**.
+
 The cache folder can be moved with `SPREAD_WINGS_CACHE=<dir>`; an empty one
 measures a first run without touching the real cache.
 
