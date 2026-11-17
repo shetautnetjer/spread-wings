@@ -176,6 +176,33 @@ test client from a fixture. That is the boundary of syntax-only rules; the
 answer past it is a compiler-level map (Swan's SCIP indexes), not more
 rules.
 
+### Compiler answers from Swan (built)
+
+`spread-wings compiler <graph.db> <swan.db>` reads a Swan map (read only).
+For each call still tied only by name, it looks at the compiler's
+resolution of that name on the same line: all outside the repo removes the
+guessed links; exactly one repo definition becomes the only link
+(`resolution = compiler`, weight 1). Anything else stays for `decide`. Run
+it before `decide`, so the model is only asked what the compiler can't say.
+
+A `compiler` link is the strongest claim in the graph, so the map has to be
+of this code. The step refuses a map whose root is another folder. It skips
+every file changed after the map's SCIP run (Swan's own "stale" rule; the
+match is by line, and lines move), and says how many calls that left out.
+On a line with several calls of one name it takes the answer only when the
+compiler answered at least as many uses as there are calls. "Left (unclear)"
+in its output also counts names the compiler ties to a parameter or a local
+variable holding a function: the real callee is whatever was passed in.
+
+| Repo | By-name calls | Swan covers | Tied to one definition | Outside |
+|---|---|---|---|---|
+| PITL (Rust, TS) | 118 | 110 | 61 | 49 |
+| Graphify (Python), after all rules | 351 | 120 | 0 | 106 (all 118 Span-02 had answered agree) |
+
+On Graphify the rest is what Pyright can't type either (`G` passed in
+untyped, test-client fixtures). A first `decide` run after `compiler` asks
+246 questions for **$0.0014**.
+
 The cache folder can be moved with `SPREAD_WINGS_CACHE=<dir>`; an empty one
 measures a first run without touching the real cache.
 
