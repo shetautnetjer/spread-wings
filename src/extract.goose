@@ -33,6 +33,7 @@ import	M	from $M import $$$X
 call	F	$F($$$A)
 assign	X	$X = $F($$$A)
 assign	X	with $F($$$A) as $X: $$$B
+iter	X	for $X in $F($$$A): $$$B
 bind	X	$X = $V
 bind	X	$X: $T = $V
 bind	X	for $X in $I: $$$B
@@ -234,7 +235,7 @@ fn extract_repo(db: i64, repo: const u8[:]) -> i64 {
     }
     for t in tids { thread_wait(t); }
 
-    let ins_sym = sqlite::prepare_or_die(db, "INSERT INTO symbols (file_id, name, kind, row, start, end_, end_row, sig) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)");
+    let ins_sym = sqlite::prepare_or_die(db, "INSERT INTO symbols (file_id, name, kind, row, start, end_, end_row, sig, params) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)");
     let ins_imp = sqlite::prepare_or_die(db, "INSERT INTO imports (file_id, module, row, names) VALUES (?1, ?2, ?3, ?4)");
     let ins_call = sqlite::prepare_or_die(db, "INSERT INTO calls (file_id, row, start, callee, in_symbol, text) VALUES (?1, ?2, ?3, ?4, 0, ?5)");
     let ins_asg = sqlite::prepare_or_die(db, "INSERT INTO assigns (file_id, row, start, name, value, in_symbol) VALUES (?1, ?2, ?3, ?4, ?5, 0)");
@@ -284,6 +285,8 @@ fn extract_repo(db: i64, repo: const u8[:]) -> i64 {
                 let er, er_ok = parse_int(if sp > 0 { f[2][..sp] } else { f[2] });
                 sqlite::bind_int(ins_sym, 7, if er_ok { er } else { row });
                 sqlite::bind_text(ins_sym, 8, if sp > 0 { f[2][sp + 1..] } else { "" });
+                let pn: u8[>..] = if f[0] == "function" && sp > 0 { param_names(f[2][sp + 1..]) } else { str("") };
+                sqlite::bind_text(ins_sym, 9, pn);
                 sqlite::step_done(ins_sym);
             }
         };
@@ -451,6 +454,21 @@ thread_fn extract_worker() {
                                         if v.len > 0 && callee_name(text) == trim(text) {
                                             record(done.data, "assign", trim(text), one_line(v, 120), st, en, row);
                                         }
+                                    } else if f[0] == "iter" {
+                                        // `for m in PAT.finditer(s)`, `for u, v in G.edges()`: each
+                                        // name is bound to what iterating f(...) yields, kept as
+                                        // `iter:f` (the outside-object rule reads it).
+                                        let v = capture(caps, "F");
+                                        if v.len > 0 {
+                                            each_split(text, ',') { part =>
+                                                var n = trim(part);
+                                                while n.len > 0 && (n[0] == '(' || n[0] == '[' || n[0] == '*') { n = trim(n[1..]); }
+                                                while n.len > 0 && (n[n.len - 1] == ')' || n[n.len - 1] == ']') { n = trim(n[..n.len - 1]); }
+                                                if n.len > 0 && find(n, ".") < 0 && find(n, "[") < 0 && callee_name(n) == n {
+                                                    record(done.data, "assign", n, str("iter:", one_line(v, 110)), st, en, row);
+                                                }
+                                            };
+                                        }
                                     } else if f[0] == "bind" {
                                         // Any other binding of a plain name (`x = other`,
                                         // `a, b = f()`, `for x in`, `with e as x`): the value
@@ -480,7 +498,7 @@ thread_fn extract_worker() {
                                         let name = callee_name(text);
                                         if name.len > 0 {
                                             let end_row = row + count_newlines(treesitter::match_text(node));
-                                            record(done.data, f[0], name, str(end_row, " ", one_line(treesitter::match_text(node), 200)), st, en, row);
+                                            record(done.data, f[0], name, str(end_row, " ", header_line(treesitter::match_text(node), job.lang == "python", 600)), st, en, row);
                                         }
                                     }
                                 }
@@ -552,6 +570,67 @@ fn one_line(s: const u8[:], n: i64) -> u8[>..] {
     for c in s {
         if c == '\n' || out.len >= n { break; }
         out.push(if c == 0x1e || c == 0x1f || c == '\r' { ' ' } else { c });
+    }
+    return out;
+}
+
+// The parameter names of a function header, as ",a,b,c,": the pieces of its
+// first parenthesised list, split at top-level commas, each one's leading
+// name (`*args`, `**kw`, `mut x`, `x: T = d`, `x = d` all give their name).
+// Types, defaults and anything nested are not names. "" when there are none.
+fn param_names(header: const u8[:]) -> u8[>..] {
+    var out: u8[>..] = [];
+    let open = find(header, "(");
+    guard open >= 0 else { return out; }
+    var depth = 0;
+    var piece: u8[>..] = [];
+    fn take() {
+        var p = trim(piece);
+        while p.len > 0 && (p[0] == '*' || p[0] == '&') { p = trim(p[1..]); }
+        if starts_with(p, "mut ") { p = trim(p[4..]); }
+        var n = 0;
+        while n < p.len && ((p[n] >= 'a' && p[n] <= 'z') || (p[n] >= 'A' && p[n] <= 'Z') || (p[n] >= '0' && p[n] <= '9') || p[n] == '_' || p[n] == '$') { n++; }
+        if n > 0 && !(p[0] >= '0' && p[0] <= '9') {
+            if out.len == 0 { out.push(','); }
+            out.append(p[..n]);
+            out.push(',');
+        }
+        piece.clear();
+    }
+    for i in open + 1 .. header.len {
+        let c = header[i];
+        if c == '(' || c == '[' || c == '{' || c == '<' { depth++; piece.push(c); }
+        else if c == ')' || c == ']' || c == '}' || c == '>' {
+            if depth == 0 { break; }
+            depth--;
+            piece.push(c);
+        }
+        else if c == ',' && depth == 0 { take(); }
+        else { piece.push(c); }
+    }
+    take();
+    return out;
+}
+
+// A definition's header on one line: through the parameter list, however
+// many lines it runs over, to the `:` (Python) or `{` that opens the body, so
+// every parameter and the return type are there (`def f(\n    a: T,\n) -> R:`).
+// The first line alone when there is no parameter list.
+fn header_line(s: const u8[:], python: bool, n: i64) -> u8[>..] {
+    var out: u8[>..] = [];
+    var depth = 0;
+    var seen_paren = false;
+    var prev_space = false;
+    for c in s {
+        if out.len >= n { break; }
+        if c == '\n' && !seen_paren { break; }
+        if c == '(' || c == '[' { depth++; if c == '(' { seen_paren = true; } }
+        else if c == ')' || c == ']' { if depth > 0 { depth--; } }
+        let end = seen_paren && depth == 0 && ((python && c == ':') || (!python && (c == '{' || c == ';')));
+        let ch = if c == '\n' || c == '\t' || c == '\r' || c == 0x1e || c == 0x1f { ' ' } else { c };
+        if !(ch == ' ' && prev_space) { out.push(ch); }
+        prev_space = ch == ' ';
+        if end { break; }
     }
     return out;
 }

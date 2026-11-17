@@ -60,8 +60,10 @@ check "mcp: a missing argument is a tool error" "import json; d=json.loads(open(
 # called on an object (so matched by name), and a hand-made Swan map that
 # resolves ping to x/b.py and pong to a library.
 mkdir -p "$work/c/x"
-printf 'def ping():\n    return 1\n\n\ndef pong():\n    return 1\n\n\ndef pang():\n    return 1\n\n\ndef peng():\n    return 1\n' > "$work/c/x/a.py"
-printf 'def ping():\n    return 2\n\n\ndef pong():\n    return 2\n\n\ndef pang():\n    return 2\n\n\ndef peng():\n    return 2\n' > "$work/c/x/b.py"
+# (Methods: a call on an object can only be a method, so module-level
+# functions of the same name are no longer candidates for `obj.ping()`.)
+printf 'class A:\n    def ping(self):\n        return 1\n\n    def pong(self):\n        return 1\n\n    def pang(self):\n        return 1\n\n    def peng(self):\n        return 1\n' > "$work/c/x/a.py"
+printf 'class B:\n    def ping(self):\n        return 2\n\n    def pong(self):\n        return 2\n\n    def pang(self):\n        return 2\n\n    def peng(self):\n        return 2\n' > "$work/c/x/b.py"
 printf 'def run(obj, other):\n    obj.ping()\n    obj.pong()\n    obj.pang(); other.pang()\n    obj.peng(); other.peng()\n' > "$work/c/x/c.py"
 "$SW" index "$work/c" "$work/c.db" >/dev/null
 # A hand-made Swan map: ping -> x/b.py; pong -> a library; the two pang calls
@@ -76,8 +78,8 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE files (file TEXT PRIMARY KEY, hash TEXT, rows INTEGER, edited_mtime INTEGER);
 CREATE TABLE symbols (id INTEGER PRIMARY KEY, name TEXT, def_file TEXT, def_line INTEGER, in_repo INTEGER);
 CREATE TABLE occurrences (symbol_id INTEGER, file TEXT, start_line INTEGER, is_def INTEGER, by_name INTEGER, is_import INTEGER);
-INSERT INTO symbols VALUES (1, 'ping', 'x/b.py', 0, 1), (2, 'pong', NULL, NULL, 0),
-    (3, 'pang', 'x/a.py', 8, 1), (4, 'pang', 'x/b.py', 8, 1), (5, 'peng', NULL, NULL, 0);
+INSERT INTO symbols VALUES (1, 'ping', 'x/b.py', 1, 1), (2, 'pong', NULL, NULL, 0),
+    (3, 'pang', 'x/a.py', 7, 1), (4, 'pang', 'x/b.py', 7, 1), (5, 'peng', NULL, NULL, 0);
 INSERT INTO occurrences VALUES (1, 'x/c.py', 1, 0, 0, 0), (2, 'x/c.py', 2, 0, 0, 0),
     (3, 'x/c.py', 3, 0, 0, 0), (4, 'x/c.py', 3, 0, 0, 0), (5, 'x/c.py', 4, 0, 0, 0);
 """)
@@ -142,10 +144,18 @@ printf 'def f(d, a, b, rows):\n    d[a, b] = 1\n    x, d[0] = rows\n    [m, n] =
 "$SW" index "$work/sub" "$work/sub.db" >/dev/null
 eq "bindings: a subscript target binds no name; tuple and list targets bind theirs" "$(q "$work/sub.db" "select group_concat(name, ' ') from (select name from assigns order by row, name)")" "x m n p q"
 
+# Rules found with PyCharm as the judge on Graphify's repo (2026-11-17): one
+# case each in tests/fixtures/rules/app.py, with what it should be.
+"$SW" index tests/fixtures/rules "$work/rules.db" >/dev/null
+want=$(grep -o '# want [a-z_]*' tests/fixtures/rules/app.py | sed 's/# want //' | paste -sd' ')
+got=$(q "$work/rules.db" "select group_concat(coalesce(c.note, (select group_concat(distinct e.resolution) from call_edges e join symbols s on s.id = e.callee where e.file_id = c.file_id and e.row = c.row and (s.name = c.callee or e.resolution = 'imported_name')), 'unlinked'), ' ') from (select k.* from calls k join files f on f.id = k.file_id where f.path = 'app.py' and k.callee in ('render', '_global_add', 'add') order by k.row) c")
+eq "rules: loop variables, returned types, local values, aliased imports, methods on local objects (10 cases)" "$got" "$want"
+eq "rules: a function's parameter names are stored, across a multi-line header" "$(printf 'def f(\n    a: int,\n    *rest,\n    key=len,\n    **kw,\n) -> int:\n    return a\n' > "$work/p.py"; mkdir -p "$work/pp" && cp "$work/p.py" "$work/pp/" && "$SW" index "$work/pp" "$work/pp.db" >/dev/null && q "$work/pp.db" "select params from symbols where name = 'f'")" ",a,rest,key,kw,"
+
 # decide: answers that can't be written are not used.
 mkdir -p "$work/dec/x"
-printf 'def ping():\n    return 1\n' > "$work/dec/x/a.py"
-printf 'def ping():\n    return 2\n' > "$work/dec/x/b.py"
+printf 'class A:\n    def ping(self):\n        return 1\n' > "$work/dec/x/a.py"
+printf 'class B:\n    def ping(self):\n        return 2\n' > "$work/dec/x/b.py"
 printf 'def run(o, p):\n    o.ping()\n    o.ping(); p.ping()\n' > "$work/dec/x/c.py"
 "$SW" index "$work/dec" "$work/dec.db" >/dev/null
 fid=$(q "$work/dec.db" "select id from files where path = 'x/c.py'")

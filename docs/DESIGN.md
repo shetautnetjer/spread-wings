@@ -178,6 +178,29 @@ were fixed, each with a test that fails on the code before:
 Not covered: comprehension variables, `match` captures and walrus targets
 are not recorded as bindings.
 
+### Rules checked against PyCharm (2026-11-17)
+
+PyCharm, asked through its own MCP server what each call resolves to, was
+the judge on Graphify's repo: 1,225 call sites in 62 seconds, at no cost
+(all 325 calls then tied only by name, and 300-site samples of the linked,
+outside and unlinked ones). It replaces the model's opinion as the score
+for a rule.
+
+| Rule | What it settles | PyCharm's verdict |
+|---|---|---|
+| A method call on a local object (`seen.add(x)`, `G.add_edge(...)` on a variable or parameter) is not a call of a module-level function of that name | 436 links removed | of 300 sampled, 290 had been wrong links, 2 real losses (a variable holding a module) |
+| `local_value`: a bare call of a parameter or of a variable the function binds (`compute(...)`, `install, uninstall = PAIR[k]`), unless the function also defines it | 71 calls, never asked | 71 of 71 are the local binding |
+| A loop variable over a library object's call (`for m in PAT.finditer(s)`, `for node in g.nodes()`); not over a builtin container, whose items can be anything | most of the gain below | no disagreement |
+| A variable assigned from a repo function whose return annotation is an outside type (`-> nx.Graph`) | | no disagreement |
+| A function imported under another name (`import global_add as _global_add`) | linked as `imported_name` | agrees |
+| A typed parameter written `g: "nx.Graph"` or `Optional[nx.Graph]`; parameters read from the whole header, however many lines | | agrees |
+| `imported_name` only for a bare call of a module-level definition; `imported_file` after the outside rules (it is the weaker evidence) | | agrees |
+
+Calls still tied only by name on Graphify's repo: **325 → 98**. PyCharm
+cannot resolve 30 of those either (untyped parameters, `with ... as x`,
+test-client calls). Linking takes 1.2 s there (was 0.8 s), parsing 1.65 s
+(was 1.3 s): seven more patterns and the full header of every definition.
+
 ### What it costs
 
 The state is numbered from the function's first line, not the file's, so a

@@ -311,15 +311,72 @@ fn link_calls(db: i64) {
             CROSS JOIN defs d ON d.name = c.callee AND d.sfile = i.dst
             WHERE k.n > 50;
         CREATE INDEX cands_cid ON cands(cid);
+        -- A method call on a local object is not a call to a module-level
+        -- function of that name: `seen.add(x)` where `seen = set()`, or
+        -- `G.add_edge(...)` on a parameter G, beside `def add(...)` in the
+        -- file. When the receiver is a variable bound in the function (or at
+        -- module level) or one of its parameters, only methods are candidates.
+        -- (PyCharm on Graphify's repo: 4 of 300 sampled import/same-file links
+        -- were this mistake.)
+        DELETE FROM cands WHERE sid IN (SELECT id FROM symbols WHERE COALESCE(container, '') = '')
+          AND cid IN (
+            SELECT k.rowid FROM calls k
+            WHERE instr(COALESCE(k.text, ''), '.') > 1
+              AND (EXISTS (SELECT 1 FROM assigns a WHERE a.file_id = k.file_id AND a.in_symbol IN (k.in_symbol, 0)
+                           AND a.name = substr(k.text, 1, instr(k.text, '.') - 1))
+                   OR EXISTS (SELECT 1 FROM symbols s WHERE s.id = k.in_symbol
+                              AND instr(COALESCE(s.params, ''), ',' || substr(k.text, 1, instr(k.text, '.') - 1) || ',') > 0)));
         CREATE TEMP TABLE chosen (cid INTEGER, sid INTEGER, resolution TEXT);
         CREATE TEMP TABLE done (cid INTEGER PRIMARY KEY);
 
-        INSERT INTO chosen SELECT cid, sid, 'same_file' FROM cands WHERE sfile = cfile;
+        -- A bare call of a name the function itself binds (a parameter, or a
+        -- variable assigned in it) is a call of that value, whatever else
+        -- shares the name: `def run(render): render(x)`, `install, uninstall
+        -- = PAIR[name]; install()`. The function's scope comes before the
+        -- file's definitions and imports. Recorded, not linked, never asked.
+        UPDATE calls SET note = 'local_value'
+        WHERE in_symbol > 0 AND rowid IN (SELECT cid FROM cands)
+          AND instr(COALESCE(text, callee), '.') = 0 AND instr(COALESCE(text, callee), '::') = 0
+          -- unless the function also defines it (`def name(...)` nested
+          -- after a loop variable `name`): the definition is what is called
+          AND NOT EXISTS (SELECT 1 FROM symbols o JOIN symbols d ON d.file_id = o.file_id AND d.name = calls.callee
+                          WHERE o.id = calls.in_symbol AND d.id != o.id AND d.row >= o.row AND d.end_row <= o.end_row)
+          AND (EXISTS (SELECT 1 FROM assigns b WHERE b.file_id = calls.file_id AND b.name = calls.callee
+                       AND b.in_symbol = calls.in_symbol)
+               OR EXISTS (SELECT 1 FROM symbols s WHERE s.id = calls.in_symbol
+                          AND instr(COALESCE(s.params, ''), ',' || calls.callee || ',') > 0));
+        INSERT OR IGNORE INTO done SELECT rowid FROM calls WHERE note = 'local_value';
+
+        INSERT INTO chosen SELECT cid, sid, 'same_file' FROM cands WHERE sfile = cfile AND cid NOT IN (SELECT cid FROM done);
         INSERT OR IGNORE INTO done SELECT cid FROM chosen;
+
+        -- A function imported under another name (`from .global_graph import
+        -- global_add as _global_add`): a bare call of the new name is a call
+        -- of the original, in the file the import names. The imports' names
+        -- hold `orig>bound` for these.
+        CREATE TEMP TABLE fn_alias AS
+            WITH RECURSIVE sp(file_id, dst, tok, rest) AS (
+                SELECT file_id, dst, '', names || ',' FROM imports WHERE dst > 0 AND instr(names, '>') > 0
+                UNION ALL SELECT file_id, dst, substr(rest, 1, instr(rest, ',') - 1), substr(rest, instr(rest, ',') + 1)
+                FROM sp WHERE rest <> '')
+            SELECT DISTINCT file_id, dst, substr(tok, 1, instr(tok, '>') - 1) AS orig, substr(tok, instr(tok, '>') + 1) AS bound
+            FROM sp WHERE instr(tok, '>') > 1;
+        INSERT INTO chosen
+            SELECT k.rowid, d.sid, 'imported_name' FROM calls k
+            JOIN fn_alias a ON a.file_id = k.file_id AND a.bound = k.callee
+            JOIN defs d ON d.name = a.orig AND d.sfile = a.dst
+            WHERE k.rowid NOT IN (SELECT cid FROM done) AND instr(COALESCE(k.text, k.callee), '.') = 0;
+        INSERT OR IGNORE INTO done SELECT cid FROM chosen;
+        DROP TABLE fn_alias;
 
         INSERT INTO chosen
             SELECT c.cid, c.sid, 'imported_name' FROM cands c
             WHERE c.cid NOT IN (SELECT cid FROM done)
+              -- the imported name is the module-level definition, called
+              -- bare: `from m import add` says nothing about `seen.add(x)`
+              -- or about a method named add in m.
+              AND (SELECT instr(COALESCE(k.text, k.callee), '.') FROM calls k WHERE k.rowid = c.cid) = 0
+              AND (SELECT COALESCE(y.container, '') FROM symbols y WHERE y.id = c.sid) = ''
               AND EXISTS (SELECT 1 FROM imports i WHERE i.file_id = c.cfile AND i.dst = c.sfile
                           AND (',' || i.names || ',') LIKE ('%,' || c.name || ',%'));
         INSERT OR IGNORE INTO done SELECT cid FROM chosen;
@@ -373,12 +430,6 @@ fn link_calls(db: i64) {
               AND EXISTS (SELECT 1 FROM aliases a JOIN prov p ON p.file_id = a.dst AND p.name = c.name
                           WHERE a.file_id = c.cfile AND p.sfile = c.sfile AND p.hop >= 1
                             AND (k.text = a.alias || '.' || c.name OR k.text = a.alias || '::' || c.name));
-        INSERT OR IGNORE INTO done SELECT cid FROM chosen;
-
-        INSERT INTO chosen
-            SELECT c.cid, c.sid, 'imported_file' FROM cands c
-            WHERE c.cid NOT IN (SELECT cid FROM done)
-              AND EXISTS (SELECT 1 FROM imports i WHERE i.file_id = c.cfile AND i.dst = c.sfile);
         INSERT OR IGNORE INTO done SELECT cid FROM chosen;
 
         -- A builtin method name (dict.get, list.append, str.join, Path.resolve,
@@ -477,10 +528,17 @@ fn link_calls(db: i64) {
         -- a module-level variable it is the whole file, since a function can
         -- rebind it (`global x`). Two rounds, so `PAT = re.compile(...)`
         -- then `m = PAT.match(...)` both count.
+        -- Each binding: the root of its value (`nx` in `nx.Graph`), whether the
+        -- value is one bare name, and whether the name is bound by iterating
+        -- the value (`for m in PAT.finditer(s)`, stored as `iter:PAT.finditer`).
+        -- ok: the binding is from outside; lib: from a library, not a builtin
+        -- container (what a `list()` yields can be anything, the repo's own
+        -- objects included, so iterating one proves nothing).
         CREATE TEMP TABLE asg AS SELECT file_id, in_symbol, name,
-            CASE WHEN instr(value, '.') > 0 THEN substr(value, 1, instr(value, '.') - 1) ELSE value END AS vroot,
-            instr(value, '.') = 0 AS bare
-            FROM assigns;
+            CASE WHEN instr(v, '.') > 0 THEN substr(v, 1, instr(v, '.') - 1) ELSE v END AS vroot,
+            instr(v, '.') = 0 AS bare, it, 0 AS ok, 0 AS lib
+            FROM (SELECT file_id, in_symbol, name, value LIKE 'iter:%' AS it,
+                         CASE WHEN value LIKE 'iter:%' THEN substr(value, 6) ELSE value END AS v FROM assigns);
         -- importlib.import_module / reload and __import__ return modules,
         -- which can be this repo's own: never outside objects, under any
         -- name they were imported as (`import importlib as il`).
@@ -489,25 +547,60 @@ fn link_calls(db: i64) {
         CREATE INDEX asg_root ON asg(file_id, vroot);
         CREATE INDEX asg_scope ON asg(file_id, in_symbol, name);
         CREATE INDEX asg_name ON asg(file_id, name, in_symbol);
-        CREATE TEMP TABLE extvar (file_id INTEGER, in_symbol INTEGER, name TEXT);
+        -- Repo functions whose return annotation is an outside type
+        -- (`def build_from_json(...) -> nx.Graph:`): what they return is an
+        -- outside object too. Per file for a name the file defines itself,
+        -- else only when every definition of the name in the repo agrees.
+        CREATE TEMP TABLE retdef AS
+            SELECT d.name, d.sfile, EXISTS (
+                SELECT 1 FROM symbols s JOIN ext x ON x.file_id = s.file_id
+                WHERE s.id = d.sid AND s.sig IS NOT NULL AND instr(s.sig, '->') > 0 AND instr(s.sig, x.name) > 0
+                  AND (s.sig GLOB '*-> ' || x.name || '[^A-Za-z0-9_]*' OR s.sig GLOB '*-> "' || x.name || '[^A-Za-z0-9_]*'
+                       OR s.sig GLOB '*-> Optional[[]' || x.name || '[^A-Za-z0-9_]*')) AS out
+            FROM defs d;
+        CREATE INDEX retdef_name ON retdef(name, sfile);
+        CREATE TEMP TABLE extvar (file_id INTEGER, in_symbol INTEGER, name TEXT, lib INTEGER);
         CREATE INDEX extvar_name ON extvar(file_id, name, in_symbol);
-        INSERT INTO extvar SELECT DISTINCT a.file_id, a.in_symbol, a.name FROM asg a
-            WHERE NOT EXISTS (SELECT 1 FROM asg b WHERE b.file_id = a.file_id AND b.name = a.name
-                AND (b.in_symbol = a.in_symbol OR a.in_symbol = 0)
-                AND NOT EXISTS (SELECT 1 FROM ext x WHERE x.file_id = b.file_id AND x.name = b.vroot)
-                AND NOT (b.bare AND b.vroot IN ('set', 'dict', 'list', 'tuple', 'str', 'int', 'float', 'bool', 'bytes', 'frozenset', 'open', 'sorted',
+
+        -- Round one: bound from an outside import, from a repo function that
+        -- returns an outside type, or (not when iterating) from a builtin.
+        UPDATE asg SET ok = 1, lib = 1 WHERE EXISTS (SELECT 1 FROM ext x WHERE x.file_id = asg.file_id AND x.name = asg.vroot);
+        UPDATE asg SET ok = 1, lib = 1 WHERE ok = 0 AND it = 0 AND bare
+            AND CASE WHEN EXISTS (SELECT 1 FROM retdef r WHERE r.name = asg.vroot AND r.sfile = asg.file_id)
+                     THEN NOT EXISTS (SELECT 1 FROM retdef r WHERE r.name = asg.vroot AND r.sfile = asg.file_id AND r.out = 0)
+                     ELSE EXISTS (SELECT 1 FROM retdef r WHERE r.name = asg.vroot)
+                          AND NOT EXISTS (SELECT 1 FROM retdef r WHERE r.name = asg.vroot AND r.out = 0) END;
+        -- ... or from a parameter typed with an outside name (`g: nx.Graph`,
+        -- then `for node in g.nodes()` or `h = g.copy()`).
+        UPDATE asg SET ok = 1, lib = 1 WHERE ok = 0 AND in_symbol > 0 AND EXISTS (
+            SELECT 1 FROM symbols s JOIN ext x ON x.file_id = s.file_id
+            WHERE s.id = asg.in_symbol AND s.sig IS NOT NULL
+              AND instr(COALESCE(s.params, ''), ',' || asg.vroot || ',') > 0 AND instr(s.sig, x.name) > 0
+              AND (s.sig GLOB '*[( ]' || asg.vroot || ': ' || x.name || '[^A-Za-z0-9_]*'
+                   OR s.sig GLOB '*[( ]' || asg.vroot || ': "' || x.name || '[^A-Za-z0-9_]*'
+                   OR s.sig GLOB '*[( ]' || asg.vroot || ': Optional[[]' || x.name || '[^A-Za-z0-9_]*'));
+        UPDATE asg SET ok = 1 WHERE ok = 0 AND it = 0 AND bare AND vroot IN ('set', 'dict', 'list', 'tuple', 'str', 'int', 'float', 'bool', 'bytes', 'frozenset', 'open', 'sorted',
                        'reversed', 'map', 'filter', 'zip', 'enumerate', 'range', 'iter', 'type', 'object', 'super')
-                         AND NOT EXISTS (SELECT 1 FROM defs d WHERE d.sfile = b.file_id AND d.name = b.vroot)));
-        INSERT INTO extvar SELECT DISTINCT a.file_id, a.in_symbol, a.name FROM asg a
+            AND NOT EXISTS (SELECT 1 FROM defs d WHERE d.sfile = asg.file_id AND d.name = asg.vroot);
+        INSERT INTO extvar
+            SELECT a.file_id, a.in_symbol, a.name, MIN(a.lib) FROM asg a
+            GROUP BY a.file_id, a.in_symbol, a.name
+            HAVING MIN(a.ok) = 1
+               AND (a.in_symbol <> 0 OR NOT EXISTS (SELECT 1 FROM asg b WHERE b.file_id = a.file_id AND b.name = a.name AND b.ok = 0));
+        -- Round two: bound from such a variable (`m = PAT.match(...)`), or by
+        -- iterating a library one (`for m in PAT.finditer(...)`,
+        -- `for u, v in G.edges()`).
+        UPDATE asg SET ok = 1,
+               lib = (SELECT MIN(v.lib) FROM extvar v WHERE v.file_id = asg.file_id AND v.name = asg.vroot
+                      AND v.in_symbol IN (asg.in_symbol, 0))
+            WHERE ok = 0 AND EXISTS (SELECT 1 FROM extvar v WHERE v.file_id = asg.file_id AND v.name = asg.vroot
+                                     AND v.in_symbol IN (asg.in_symbol, 0) AND (asg.it = 0 OR v.lib = 1));
+        INSERT INTO extvar
+            SELECT a.file_id, a.in_symbol, a.name, MIN(a.lib) FROM asg a
             WHERE NOT EXISTS (SELECT 1 FROM extvar v WHERE v.file_id = a.file_id AND v.in_symbol = a.in_symbol AND v.name = a.name)
-              AND NOT EXISTS (SELECT 1 FROM asg b WHERE b.file_id = a.file_id AND b.name = a.name
-                AND (b.in_symbol = a.in_symbol OR a.in_symbol = 0)
-                AND NOT EXISTS (SELECT 1 FROM ext x WHERE x.file_id = b.file_id AND x.name = b.vroot)
-                AND NOT EXISTS (SELECT 1 FROM extvar v WHERE v.file_id = b.file_id AND v.name = b.vroot
-                                AND v.in_symbol IN (b.in_symbol, 0))
-                AND NOT (b.bare AND b.vroot IN ('set', 'dict', 'list', 'tuple', 'str', 'int', 'float', 'bool', 'bytes', 'frozenset', 'open', 'sorted',
-                       'reversed', 'map', 'filter', 'zip', 'enumerate', 'range', 'iter', 'type', 'object', 'super')
-                         AND NOT EXISTS (SELECT 1 FROM defs d WHERE d.sfile = b.file_id AND d.name = b.vroot)));
+            GROUP BY a.file_id, a.in_symbol, a.name
+            HAVING MIN(a.ok) = 1
+               AND (a.in_symbol <> 0 OR NOT EXISTS (SELECT 1 FROM asg b WHERE b.file_id = a.file_id AND b.name = a.name AND b.ok = 0));
 
         UPDATE calls SET note = 'outside_object'
         WHERE rowid IN (SELECT cid FROM cands)
@@ -521,14 +614,43 @@ fn link_calls(db: i64) {
                          -- its own: a local binding, or a parameter of that name
                          OR (v.in_symbol = 0 AND NOT EXISTS (SELECT 1 FROM asg b WHERE b.file_id = calls.file_id
                                 AND b.in_symbol = calls.in_symbol AND b.name = v.name)
-                             AND NOT EXISTS (SELECT 1 FROM symbols s WHERE s.id = calls.in_symbol AND s.sig IS NOT NULL
-                                AND s.sig GLOB '*[(, *]' || v.name || '[,:=) ]*'))))
+                             AND NOT EXISTS (SELECT 1 FROM symbols s WHERE s.id = calls.in_symbol
+                                AND instr(COALESCE(s.params, ''), ',' || v.name || ',') > 0))))
             -- a parameter typed with an outside name: `(G: nx.Graph`, `, g: Graph)`.
             -- The type must end there: `g: GraphView` is not `Graph`.
             OR EXISTS (SELECT 1 FROM symbols s JOIN ext x ON x.file_id = s.file_id
                        WHERE s.id = calls.in_symbol AND s.sig IS NOT NULL
-                         AND s.sig GLOB '*[( ]' || substr(text, 1, instr(text, '.') - 1) || ': ' || x.name || '[^A-Za-z0-9_]*'));
+                         AND instr(COALESCE(s.params, ''), ',' || substr(text, 1, instr(text, '.') - 1) || ',') > 0
+                         AND instr(s.sig, x.name) > 0
+                         AND (s.sig GLOB '*[( ]' || substr(text, 1, instr(text, '.') - 1) || ': ' || x.name || '[^A-Za-z0-9_]*'
+                              OR s.sig GLOB '*[( ]' || substr(text, 1, instr(text, '.') - 1) || ': "' || x.name || '[^A-Za-z0-9_]*'
+                              OR s.sig GLOB '*[( ]' || substr(text, 1, instr(text, '.') - 1) || ': Optional[[]' || x.name || '[^A-Za-z0-9_]*')));
         INSERT OR IGNORE INTO done SELECT rowid FROM calls WHERE note = 'outside_object';
+
+        -- The caller's file imports a file that defines the name. Weaker
+        -- than the rules above (the import names the file, not this name),
+        -- so it comes after them: `m.render()` on a regex match is an
+        -- outside call even when the file imports a module with a render().
+        INSERT INTO chosen
+            SELECT c.cid, c.sid, 'imported_file' FROM cands c
+            WHERE c.cid NOT IN (SELECT cid FROM done)
+              AND EXISTS (SELECT 1 FROM imports i WHERE i.file_id = c.cfile AND i.dst = c.sfile);
+        INSERT OR IGNORE INTO done SELECT cid FROM chosen;
+
+        -- A bare call of a name that is a parameter of the function, or a
+        -- variable bound in it or at module level (`compute(...)` where
+        -- compute was passed in, `ids = lambda ...`): the callee is whatever
+        -- value that name holds, not some definition elsewhere that shares
+        -- the name. Recorded, not linked, and never a question.
+        UPDATE calls SET note = 'local_value'
+        WHERE rowid IN (SELECT cid FROM cands)
+          AND rowid NOT IN (SELECT cid FROM done)
+          AND instr(COALESCE(text, callee), '.') = 0 AND instr(COALESCE(text, callee), '::') = 0
+          AND (EXISTS (SELECT 1 FROM asg b WHERE b.file_id = calls.file_id AND b.name = calls.callee
+                       AND b.in_symbol IN (calls.in_symbol, 0))
+               OR EXISTS (SELECT 1 FROM symbols s WHERE s.id = calls.in_symbol
+                          AND instr(COALESCE(s.params, ''), ',' || calls.callee || ',') > 0));
+        INSERT OR IGNORE INTO done SELECT rowid FROM calls WHERE note = 'local_value';
 
         INSERT INTO chosen
             SELECT c.cid, c.sid, 'by_name' FROM cands c
@@ -540,7 +662,7 @@ fn link_calls(db: i64) {
             FROM chosen ch JOIN calls c ON c.rowid = ch.cid;
 
         DROP TABLE defs; DROP TABLE ndefs; DROP TABLE cands; DROP TABLE chosen; DROP TABLE done;
-        DROP TABLE pend; DROP TABLE prov; DROP TABLE roots; DROP TABLE ext; DROP TABLE asg; DROP TABLE extvar;
+        DROP TABLE pend; DROP TABLE prov; DROP TABLE roots; DROP TABLE ext; DROP TABLE asg; DROP TABLE extvar; DROP TABLE retdef;
     """);
     call_file_edges(db);
 }
