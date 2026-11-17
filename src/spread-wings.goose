@@ -19,6 +19,7 @@ import .store;
 import .extract;
 import .graph;
 import .decide;
+import .compiler;
 
 let VERSION = "0.1.0";
 
@@ -49,6 +50,7 @@ spread-wings 0.1.0: a broad code graph from syntax alone
   spread-wings neighbors <graph.db> <path>
   spread-wings callers <graph.db> <name>
   spread-wings serve <graph.db>
+  spread-wings compiler <graph.db> <swan.db>   compiler answers from a Swan map for calls still by_name
   spread-wings decide <graph.db> [--max N] [--workers N]   Span-02 decisions for calls still by_name
                                             (OPENROUTER_API_KEY in the environment; default 5000 questions, 32 parallel requests)
 """);
@@ -251,7 +253,7 @@ fn callers(db: i64, name: const u8[:], out: u8[>..]&) {
     sqlite::bind_text(st, 1, name);
     out.append("{\"name\":");
     json::format_string(out, name);
-    out.append(",\"evidence\":\"each site's resolution says how it was tied to a definition: same_file, imported_name, imported_file, or by_name (any definition with this name)\",\"sites\":[");
+    out.append(",\"evidence\":\"each site's resolution says how it was tied to a definition: same_file, imported_name, module_alias or imported_file (import evidence), compiler (a Swan map), decided (Span-02, weight = probability), by_name (any definition with this name), or unlinked (a library, builtin or outside object)\",\"sites\":[");
     var first = true;
     while sqlite::step(st, err) == 1 {
         if !first { out.push(','); }
@@ -382,6 +384,10 @@ fn main() {
         return;
     }
     if cmd == "serve" && a.len == 3 { serve_main(a[2]); return; }
+    if cmd == "compiler" && a.len == 4 {
+        compiler_main(a[2], a[3]);
+        return;
+    }
     if cmd == "decide" {
         var maxq: i64 = 5000;
         var workers: i64 = 32;

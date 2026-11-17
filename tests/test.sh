@@ -56,6 +56,31 @@ check "mcp: tools/list names the four tools" "import json; d=json.loads(open('$w
 check "mcp: find load returns web/store.ts" "import json; d=json.loads(open('$work/mcp.txt').read().splitlines()[2]); r=json.loads(d['result']['content'][0]['text']); assert any(x['path']=='web/store.ts' for x in r)"
 check "mcp: a missing argument is a tool error" "import json; d=json.loads(open('$work/mcp.txt').read().splitlines()[3]); assert d['result']['isError'] is True"
 
+# Compiler answers: a tiny repo with two definitions each of ping and pong,
+# called on an object (so matched by name), and a hand-made Swan map that
+# resolves ping to x/b.py and pong to a library.
+mkdir -p "$work/c/x"
+printf 'def ping():\n    return 1\n\n\ndef pong():\n    return 1\n' > "$work/c/x/a.py"
+printf 'def ping():\n    return 2\n\n\ndef pong():\n    return 2\n' > "$work/c/x/b.py"
+printf 'def run(obj):\n    obj.ping()\n    obj.pong()\n' > "$work/c/x/c.py"
+"$SW" index "$work/c" "$work/c.db" >/dev/null
+python3 - "$work/swan.db" <<'PY'
+import sqlite3, sys
+d = sqlite3.connect(sys.argv[1])
+d.executescript("""
+CREATE TABLE symbols (id INTEGER PRIMARY KEY, name TEXT, def_file TEXT, def_line INTEGER, in_repo INTEGER);
+CREATE TABLE occurrences (symbol_id INTEGER, file TEXT, start_line INTEGER, is_def INTEGER, by_name INTEGER, is_import INTEGER);
+INSERT INTO symbols VALUES (1, 'ping', 'x/b.py', 0, 1), (2, 'pong', NULL, NULL, 0);
+INSERT INTO occurrences VALUES (1, 'x/c.py', 1, 0, 0, 0), (2, 'x/c.py', 2, 0, 0, 0);
+""")
+d.commit()
+PY
+check "compiler: before Swan's answers, ping is matched by name" "import json,subprocess; d=json.loads(subprocess.check_output(['$SW','callers','$work/c.db','ping'])); assert {s['resolution'] for s in d['sites']} == {'by_name'}"
+"$SW" compiler "$work/c.db" "$work/swan.db" >/dev/null
+check "compiler: ping is tied to x/b.py, the definition the compiler names" "import json,subprocess; d=json.loads(subprocess.check_output(['$SW','callers','$work/c.db','ping'])); assert [(s['resolution'], s['defined_in']) for s in d['sites']] == [('compiler', 'x/b.py')]"
+check "compiler: pong, resolved outside the repo, keeps no guessed links" "import json,subprocess; d=json.loads(subprocess.check_output(['$SW','callers','$work/c.db','pong'])); assert [(s['resolution'], s['defined_in']) for s in d['sites']] == [('unlinked', '')]"
+check "compiler: a missing Swan map is an error" "import subprocess; r=subprocess.run(['$SW','compiler','$work/c.db','$work/none.db'],capture_output=True); assert r.returncode != 0"
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]
