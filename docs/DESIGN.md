@@ -146,6 +146,38 @@ re-exported or aliased repo function "outside"; the rule was right. With
 these rules, by-name call links on Graphify's repo dropped from 78,761 to
 33,007 and the questions needed from 12,816 to 2,489.
 
+### Corrections from review (2026-11-17)
+
+A review bot's unverified notes were checked with fixtures; these held and
+were fixed, each with a test that fails on the code before:
+
+- **Common names.** A name defined in more than 50 places had no
+  candidates at all, so `helper()` beside `def helper` went unlinked. Such
+  names now keep the candidates in the caller's own file and in files it
+  imports (Graphify's repo: 17,530 → 20,380 `same_file` links).
+- **ES imports over several lines** (`import {` … `} from "./m"`) were not
+  read, and `./m.js` naming a real `m.js` was not linked.
+- **Python packages below another folder** (`python/mypkg/…`): `import
+  mypkg.core` now finds the file by its path below any folder that is not
+  itself a package; before, such calls were marked `external`.
+- **`outside_object` was too trusting.** It saw only `x = f(...)`. Every
+  other binding of the name (`x = other`, a tuple target, `for x in`,
+  `with e as x`) is now recorded with an unknown value, which is never
+  outside; a module-level variable is judged over the whole file (a function
+  can rebind it with `global`) and is hidden by a parameter of the same
+  name; a typed parameter must name the type exactly (`g: GraphView` is not
+  `Graph`); `importlib` is excluded under any name it was imported as. On
+  Graphify's repo this cost 4 of 762 notes.
+- **`decide`** no longer uses an answer that names a definition it was not
+  offered, nor two differing answers for two calls of one name on a line
+  (links are kept per line and name); with questions to ask and no key it
+  stops at once.
+- **A graph written by another version** is refused with "rebuild it"
+  (a layout number in `meta`), not a raw SQL error.
+
+Not covered: comprehension variables, `match` captures and walrus targets
+are not recorded as bindings.
+
 ### What it costs
 
 The state is numbered from the function's first line, not the file's, so a

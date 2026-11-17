@@ -42,6 +42,16 @@ int64_t sw_mtime_ns(sw_slice path) {
     return (int64_t)st.st_mtim.tv_sec * 1000000000LL + (int64_t)st.st_mtim.tv_nsec;
 }
 
+/* Whether an environment variable is set and not empty. The decision step
+   asks this about its API key: the key itself is only ever read by the HTTP
+   helper, in C, so it never sits in a Goose buffer. */
+bool sw_env_set(sw_slice name) {
+    char buf[256];
+    if (!to_cstr(name, buf, sizeof buf)) return false;
+    const char *v = getenv(buf);
+    return v && *v;
+}
+
 /* mkdir -p, for the decision cache. */
 #include <errno.h>
 #include <sys/types.h>

@@ -33,6 +33,10 @@ import	M	from $M import $$$X
 call	F	$F($$$A)
 assign	X	$X = $F($$$A)
 assign	X	with $F($$$A) as $X: $$$B
+bind	X	$X = $V
+bind	X	$X: $T = $V
+bind	X	for $X in $I: $$$B
+bind	X	with $E as $X: $$$B
 """;
     }
     if lang == "rust" {
@@ -76,6 +80,8 @@ import	M	require($M)
 call	F	$F($$$A)
 assign	X	const $X = $F($$$A)
 assign	X	let $X = $F($$$A)
+bind	X	$X = $V
+bind	X	let $X = $V
 """;
     }
     // typescript, tsx
@@ -94,6 +100,8 @@ import	M	require($M)
 call	F	$F($$$A)
 assign	X	const $X = $F($$$A)
 assign	X	let $X = $F($$$A)
+bind	X	$X = $V
+bind	X	let $X = $V
 """;
 }
 
@@ -304,6 +312,11 @@ fn extract_repo(db: i64, repo: const u8[:]) -> i64 {
             WHERE s.file_id = calls.file_id AND s.start <= calls.start AND calls.start < s.end_
               AND s.kind IN ('function', 'impl')
             ORDER BY s.end_ - s.start LIMIT 1), 0);
+        -- A binding whose value was read (`x = f()`) is also matched by the
+        -- catch-all pattern; the unknown-value twin goes.
+        DELETE FROM assigns WHERE value = '?' AND EXISTS (
+            SELECT 1 FROM assigns b WHERE b.file_id = assigns.file_id AND b.name = assigns.name
+              AND b.start = assigns.start AND b.value <> '?');
         UPDATE assigns SET in_symbol = COALESCE((
             SELECT s.id FROM symbols s
             WHERE s.file_id = assigns.file_id AND s.start <= assigns.start AND assigns.start < s.end_
@@ -438,6 +451,17 @@ thread_fn extract_worker() {
                                         if v.len > 0 && callee_name(text) == trim(text) {
                                             record(done.data, "assign", trim(text), one_line(v, 120), st, en, row);
                                         }
+                                    } else if f[0] == "bind" {
+                                        // Any other binding of a plain name (`x = other`,
+                                        // `a, b = f()`, `for x in`, `with e as x`): the value
+                                        // is unknown here. Where a call-form assign matched
+                                        // the same statement, that one is kept (store step).
+                                        each_split(text, ',') { part =>
+                                            var n = trim(part);
+                                            while n.len > 0 && (n[0] == '(' || n[0] == '[' || n[0] == '*') { n = trim(n[1..]); }
+                                            while n.len > 0 && (n[n.len - 1] == ')' || n[n.len - 1] == ']') { n = trim(n[..n.len - 1]); }
+                                            if n.len > 0 && find(n, ".") < 0 && callee_name(n) == n { record(done.data, "assign", n, "?", st, en, row); }
+                                        };
                                     } else if f[0] == "call" {
                                         let c = callee_name(text);
                                         if c.len > 0 { record(done.data, "call", c, one_line(text, 120), st, en, row); }
@@ -458,10 +482,31 @@ thread_fn extract_worker() {
             // read from the text (a pattern can't hold the module string).
             if job.lang == "typescript" || job.lang == "tsx" || job.lang == "javascript" {
                 var row = 0;
+                // A statement whose braces close on a later line
+                // (`import {` ... `} from "m";`) is read as one line, at the
+                // row it starts on.
+                var pending: u8[>..] = [];
+                var pend_row = 0;
+                var stmt: u8[>..] = [];
+                var stmt_row = 0;
                 each_split(text, '\n') { raw =>
                     row++;
-                    let line = trim(raw);
-                    if starts_with(line, "import ") || starts_with(line, "import\"") || starts_with(line, "import'") || starts_with(line, "export ") {
+                    let t = trim(raw);
+                    var have = false;
+                    if pending.len > 0 {
+                        pending.push(' ');
+                        pending.append(t);
+                        if find(t, "}") >= 0 || row - pend_row >= 400 {
+                            stmt.clear(); stmt.append(pending); stmt_row = pend_row; pending.clear(); have = true;
+                        }
+                    } else if starts_with(t, "import ") || starts_with(t, "import\"") || starts_with(t, "import'") || starts_with(t, "export ") {
+                        let opens = (starts_with(t, "import ") || starts_with(t, "export {") || starts_with(t, "export type {"))
+                                    && find(t, "{") >= 0 && find(t, "}") < 0 && find(t, "(") < 0 && find(t, "=") < 0;
+                        if opens { pending.append(t); pend_row = row; }
+                        else { stmt.clear(); stmt.append(t); stmt_row = row; have = true; }
+                    }
+                    if have {
+                        let line = stmt[..];
                         var at = find(line, " from ");
                         if at >= 0 { at = at + 6; } else if starts_with(line, "import") { at = 6; } else { at = -1; }
                         if at >= 0 {
@@ -478,7 +523,7 @@ thread_fn extract_worker() {
                                         if starts_with(head, "* as ") { names.push('@'); names.append(trim(head[5..])); }
                                         else { import_names(head, names); }
                                     }
-                                    record(done.data, "import", rest[1..1 + close], names, 0, 0, row);
+                                    record(done.data, "import", rest[1..1 + close], names, 0, 0, stmt_row);
                                 }
                             }
                         }

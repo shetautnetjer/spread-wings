@@ -52,10 +52,27 @@ fn open_fresh(path: const u8[:]) -> i64 {
     return db;
 }
 
+// The number of this file's layout (the tables and columns above). It goes
+// up whenever they change; a graph written with another number is rebuilt,
+// not read: indexing takes seconds, and a command that met a missing column
+// used to stop with a raw SQL error.
+let SCHEMA_NUMBER = "6";
+
 fn open_map(path: const u8[:]) -> i64 {
     var err: u8[>..] = [];
     let db = sqlite::open_existing(path, err);
     guard db != 0 else { abort(str("spread-wings: cannot open ", path, ": ", err)); }
+    var have: u8[>..] = [];
+    let st = sqlite::prepare(db, "SELECT value FROM meta WHERE key = 'schema'", err);
+    if st != 0 {
+        if sqlite::step(st, err) == 1 { sqlite::col_text(st, 0, have); }
+        sqlite::finalize(st);
+    }
+    guard have == SCHEMA_NUMBER else {
+        abort(str("spread-wings: ", path, " was written by another version of spread-wings (layout ",
+                  if have.len > 0 { have[..] } else { "unnumbered" }, ", this one reads ", SCHEMA_NUMBER,
+                  "); rebuild it: spread-wings index <repo> ", path));
+    }
     return db;
 }
 

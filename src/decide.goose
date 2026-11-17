@@ -19,6 +19,7 @@ import .store;
 import .graph;
 
 extern fn sw_mkdirs(path: const u8[:]) -> bool;
+extern fn sw_env_set(name: const u8[:]) -> bool;
 extern fn sw_http_post(url: const u8[:], key_env: const u8[:], body: const u8[:], timeout_s: i64, out: u8[>..]&) -> i64;
 
 let MODEL = "respan/span-02";
@@ -289,6 +290,12 @@ fn decide_main(db_path: const u8[:], max_questions: i64, max_workers: i64) {
     r_len.resize(nreq, 0);
     r_status.resize(nreq, 0);
     let t0 = clock();
+    // Nothing to ask needs no key (everything came from the cache). With
+    // questions and no key, stop now: each request would otherwise fail and
+    // be retried for 15 seconds.
+    guard nreq == 0 || sw_env_set(KEY_ENV) else {
+        abort(str("spread-wings decide: ", nreq, " requests to send and ", KEY_ENV, " is not set"));
+    }
     if nreq > 0 {
         var k = 0;
         each_split(bodies, 0x1e) { b =>
@@ -395,6 +402,49 @@ fn decide_main(db_path: const u8[:], max_questions: i64, max_workers: i64) {
         if p < MIN_P { unsure++; } else if target != 0 { decided++; } else { outside++; }
     }
     sqlite::finalize(ins_dec);
+    let dropped = apply_decisions(db);
+    call_file_edges(db);
+    var gs: u8[>..] = [];
+    get_meta(db, "resolution", gs);
+    let g100, g_ok = parse_int(gs);
+    let rounds = communities(db, if g_ok && g100 > 0 { g100 as f64 / 100.0 } else { 1.5 });
+    set_meta(db, "decided_with", MODEL);
+    sqlite::exec_or_die(db, "COMMIT");
+    sqlite::finalize(cache_get);
+    sqlite::finalize(cache_put);
+    sqlite::close(cache);
+    print(str("spread-wings decide: ", asked, " questions asked in ", nreq, " requests (", failed_requests, " failed), ",
+              from_cache, " from cache; ", decided, " calls tied to one definition, ", outside, " found to be outside the repo, ",
+              unsure, " left as by_name (p < 0.6); ", dropped, " answers not used (see apply_decisions); ", input_tokens, " input tokens, $",
+              cost_micro / 1000000, ".", pad6(cost_micro % 1000000), "; ", ((t1 - t0) * 1000.0) as i64, " ms asking; ",
+              scalar(db, "SELECT COUNT(*) FROM communities"), " communities (", rounds, " rounds)"));
+    sqlite::close(db);
+}
+
+// Writes the rows of `decisions` into the links. Returns how many answers
+// were not used, for one of two reasons:
+//   - the answer names a definition that was not one of that call's
+//     by_name candidates. Nothing offered it, so it is not an answer;
+//     taking it would delete every real candidate and link nothing.
+//   - links are kept per line and name, and two calls of one name on a line
+//     (`a.render(), b.render()`) got answers that differ, or only one of
+//     them a sure one. Writing either would overwrite the other call's
+//     links, so both stay by_name.
+fn apply_decisions(db: i64) -> i64 {
+    let before = scalar(db, "SELECT COUNT(*) FROM decisions");
+    sqlite::exec_or_die(db, """
+        DELETE FROM decisions WHERE target > 0 AND NOT EXISTS (
+            SELECT 1 FROM call_edges e WHERE e.file_id = decisions.file_id AND e.row = decisions.row
+              AND e.callee = decisions.target AND e.resolution = 'by_name');
+        CREATE TEMP TABLE clash AS
+            SELECT DISTINCT a.file_id, a.row, a.callee FROM decisions a JOIN decisions b
+              ON b.file_id = a.file_id AND b.row = a.row AND b.callee = a.callee AND b.rowid <> a.rowid
+            WHERE a.target <> b.target OR a.p < 600 OR b.p < 600;
+        DELETE FROM decisions WHERE EXISTS (
+            SELECT 1 FROM clash c WHERE c.file_id = decisions.file_id AND c.row = decisions.row AND c.callee = decisions.callee);
+        DROP TABLE clash;
+    """);
+    let dropped = before - scalar(db, "SELECT COUNT(*) FROM decisions");
     sqlite::exec_or_die(db, """
         -- Sure about one definition: it becomes the only link, weight p.
         DELETE FROM call_edges WHERE resolution = 'by_name' AND rowid IN (
@@ -409,21 +459,18 @@ fn decide_main(db_path: const u8[:], max_questions: i64, max_workers: i64) {
               AND d.target = call_edges.callee AND d.p >= 600);
         DELETE FROM file_edges WHERE kind = 'call';
     """);
+    return dropped;
+}
+
+// For the tests: applies whatever rows the decisions table holds, asking
+// nothing (`spread-wings decide-apply <graph.db>`).
+fn decide_apply_main(db_path: const u8[:]) {
+    let db = open_map(db_path);
+    sqlite::exec_or_die(db, "BEGIN");
+    let dropped = apply_decisions(db);
     call_file_edges(db);
-    var gs: u8[>..] = [];
-    get_meta(db, "resolution", gs);
-    let g100, g_ok = parse_int(gs);
-    let rounds = communities(db, if g_ok && g100 > 0 { g100 as f64 / 100.0 } else { 1.5 });
-    set_meta(db, "decided_with", MODEL);
     sqlite::exec_or_die(db, "COMMIT");
-    sqlite::finalize(cache_get);
-    sqlite::finalize(cache_put);
-    sqlite::close(cache);
-    print(str("spread-wings decide: ", asked, " questions asked in ", nreq, " requests (", failed_requests, " failed), ",
-              from_cache, " from cache; ", decided, " calls tied to one definition, ", outside, " found to be outside the repo, ",
-              unsure, " left as by_name (p < 0.6); ", input_tokens, " input tokens, $",
-              cost_micro / 1000000, ".", pad6(cost_micro % 1000000), "; ", ((t1 - t0) * 1000.0) as i64, " ms asking; ",
-              scalar(db, "SELECT COUNT(*) FROM communities"), " communities (", rounds, " rounds)"));
+    print(str("spread-wings decide-apply: ", scalar(db, "SELECT COUNT(*) FROM decisions"), " answers applied, ", dropped, " not used"));
     sqlite::close(db);
 }
 
