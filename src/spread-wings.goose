@@ -49,6 +49,7 @@ spread-wings 0.1.0: a broad code graph from syntax alone
   spread-wings find <graph.db> <name>
   spread-wings neighbors <graph.db> <path>
   spread-wings callers <graph.db> <name>
+  spread-wings touches <graph.db> <name> [path]   what changing it reaches: files, tests, groups
   spread-wings serve <graph.db>
   spread-wings compiler <graph.db> <swan.db>   compiler answers from a Swan map for calls still by_name
   spread-wings decide <graph.db> [--max N] [--workers N]   Span-02 decisions for calls still by_name
@@ -279,6 +280,125 @@ fn callers(db: i64, name: const u8[:], out: u8[>..]&) {
     out.append("]}");
 }
 
+// What changing a definition touches, in one answer: the files that define
+// it, call it or import its file, which of those are tests, and which
+// groups of the repo they sit in. The broad view to take before an edit;
+// Swan then gives the exact sites and makes the edits. `path` narrows a
+// name defined in several files to the one meant.
+fn touches(db: i64, name: const u8[:], path: const u8[:], out: u8[>..]&) -> bool {
+    var err: u8[>..] = [];
+    sqlite::exec_or_die(db, "DROP TABLE IF EXISTS temp.t_defs; DROP TABLE IF EXISTS temp.t_touch;");
+    let mk = sqlite::prepare_or_die(db, """
+        CREATE TEMP TABLE t_defs AS
+            SELECT s.id, s.file_id, s.row, s.kind FROM symbols s JOIN files f ON f.id = s.file_id
+            WHERE s.name = ?1 AND (?2 = '' OR f.path = ?2)
+        """);
+    sqlite::bind_text(mk, 1, name);
+    sqlite::bind_text(mk, 2, path);
+    sqlite::step_done(mk);
+    sqlite::finalize(mk);
+    guard scalar(db, "SELECT COUNT(*) FROM temp.t_defs") > 0 else {
+        format(out, "no definition named '", name, "'", if path.len > 0 { str(" in ", path) } else { str("") });
+        return false;
+    }
+    sqlite::exec_or_die(db, """
+        CREATE TEMP TABLE t_touch AS
+            SELECT file_id, MAX(d) AS defines, SUM(c) AS sites, SUM(g) AS guessed, MAX(i) AS imports FROM (
+                SELECT file_id, 1 AS d, 0 AS c, 0 AS g, 0 AS i FROM t_defs
+                UNION ALL
+                SELECT e.file_id, 0, 1, e.resolution = 'by_name', 0
+                FROM (SELECT DISTINCT file_id, row, resolution FROM call_edges
+                      WHERE callee IN (SELECT id FROM t_defs)) e
+                UNION ALL
+                SELECT file_id, 0, 0, 0, 1 FROM (SELECT DISTINCT file_id FROM imports
+                                                 WHERE dst IN (SELECT file_id FROM t_defs)))
+            GROUP BY file_id;
+    """);
+    out.append("{\"name\":");
+    json::format_string(out, name);
+    out.append(",\"definitions\":[");
+    let ds = sqlite::prepare_or_die(db, """
+        SELECT f.path, d.row, d.kind, COALESCE(f.community, 0) FROM t_defs d JOIN files f ON f.id = d.file_id
+        ORDER BY f.path, d.row
+        """);
+    var first = true;
+    while sqlite::step(ds, err) == 1 {
+        if !first { out.push(','); }
+        first = false;
+        var p: u8[>..] = [];
+        var k: u8[>..] = [];
+        sqlite::col_text(ds, 0, p);
+        sqlite::col_text(ds, 2, k);
+        out.push('{');
+        jstr(out, "path", p); out.push(',');
+        jint(out, "line", sqlite::col_int(ds, 1)); out.push(',');
+        jstr(out, "kind", k); out.push(',');
+        jint(out, "community", sqlite::col_int(ds, 3));
+        out.push('}');
+    }
+    sqlite::finalize(ds);
+    out.append("],\"files\":[");
+    let fs = sqlite::prepare_or_die(db, """
+        SELECT f.path, t.defines, t.sites, t.guessed, t.imports, COALESCE(f.is_test, 0), COALESCE(f.community, 0)
+        FROM t_touch t JOIN files f ON f.id = t.file_id
+        ORDER BY t.defines DESC, f.is_test, t.sites DESC, f.path LIMIT 400
+        """);
+    first = true;
+    while sqlite::step(fs, err) == 1 {
+        if !first { out.push(','); }
+        first = false;
+        var p: u8[>..] = [];
+        sqlite::col_text(fs, 0, p);
+        out.push('{');
+        jstr(out, "path", p);
+        out.append(",\"why\":[");
+        var w = 0;
+        if sqlite::col_int(fs, 1) > 0 { out.append("\"defines it\""); w++; }
+        if sqlite::col_int(fs, 2) > 0 { if w > 0 { out.push(','); } out.append("\"calls it\""); w++; }
+        if sqlite::col_int(fs, 4) > 0 { if w > 0 { out.push(','); } out.append("\"imports its file\""); }
+        out.append("],");
+        jint(out, "call_sites", sqlite::col_int(fs, 2)); out.push(',');
+        jint(out, "matched_by_name_only", sqlite::col_int(fs, 3));
+        out.append(",\"is_test\":");
+        out.append(if sqlite::col_int(fs, 5) > 0 { "true" } else { "false" });
+        out.push(',');
+        jint(out, "community", sqlite::col_int(fs, 6));
+        out.push('}');
+    }
+    sqlite::finalize(fs);
+    out.append("],\"tests\":");
+    text_list(db, "SELECT f.path FROM t_touch t JOIN files f ON f.id = t.file_id WHERE f.is_test = 1 ORDER BY f.path", 0, out);
+    out.append(",\"communities\":[");
+    let cs = sqlite::prepare_or_die(db, """
+        SELECT COALESCE(f.community, 0), COALESCE(c.label, ''), COUNT(*)
+        FROM t_touch t JOIN files f ON f.id = t.file_id LEFT JOIN communities c ON c.id = f.community
+        GROUP BY f.community ORDER BY COUNT(*) DESC
+        """);
+    first = true;
+    while sqlite::step(cs, err) == 1 {
+        if !first { out.push(','); }
+        first = false;
+        var l: u8[>..] = [];
+        sqlite::col_text(cs, 1, l);
+        out.push('{');
+        jint(out, "id", sqlite::col_int(cs, 0)); out.push(',');
+        jstr(out, "label", l); out.push(',');
+        jint(out, "files", sqlite::col_int(cs, 2));
+        out.push('}');
+    }
+    sqlite::finalize(cs);
+    out.append("],\"summary\":{");
+    jint(out, "definitions", scalar(db, "SELECT COUNT(*) FROM temp.t_defs")); out.push(',');
+    jint(out, "files", scalar(db, "SELECT COUNT(*) FROM temp.t_touch")); out.push(',');
+    jint(out, "test_files", scalar(db, "SELECT COUNT(*) FROM temp.t_touch t JOIN files f ON f.id = t.file_id WHERE f.is_test = 1")); out.push(',');
+    jint(out, "communities", scalar(db, "SELECT COUNT(DISTINCT COALESCE(f.community, 0)) FROM temp.t_touch t JOIN files f ON f.id = t.file_id")); out.push(',');
+    jint(out, "call_sites", scalar(db, "SELECT COALESCE(SUM(sites), 0) FROM temp.t_touch")); out.push(',');
+    jint(out, "matched_by_name_only", scalar(db, "SELECT COALESCE(SUM(guessed), 0) FROM temp.t_touch"));
+    out.append("},\"evidence\":\"from syntax: call sites tied by import evidence, a compiler map or a decision count as calls; matched_by_name_only counts the ones tied by name alone, which may be another definition's. A file that only imports the defining file may not use this name. For the exact sites and to make the edits, use Swan.\"}");
+    sqlite::exec_or_die(db, "DROP TABLE temp.t_defs; DROP TABLE temp.t_touch;");
+    return true;
+}
+
 // --- MCP over stdio ------------------------------------------------------------
 
 let TOOLS = """
@@ -286,7 +406,8 @@ let TOOLS = """
 {"name":"overview","description":"The repo's communities (groups of files that import and call each other), each with its main files and most-called definitions. Start here to understand an unfamiliar codebase. Links are matched by name or path from syntax, not compiler-resolved.","inputSchema":{"type":"object","properties":{}}},
 {"name":"find","description":"Definitions (functions, classes, structs, traits, interfaces) by exact name, or containing the name when it has 3+ characters, with file, line, community and how many call sites use that name.","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
 {"name":"neighbors","description":"One file's definitions, the files it imports and is imported by, and the files it calls into and is called from (by name).","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Path relative to the repo root."}},"required":["path"]}},
-{"name":"callers","description":"Call sites of a name, with file, line and the definition they sit in. Matched by name: calls to any definition with this name.","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}}
+{"name":"callers","description":"Call sites of a name, with file, line and the definition they sit in. Matched by name: calls to any definition with this name.","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
+{"name":"touches","description":"What changing a definition reaches, in one answer, before you edit: the files that define it, call it or import its file, which of them are tests, and which groups of the repo they are in. Pass path when the name is defined in several files. Broad and from syntax; use Swan for the exact sites and to make the edits.","inputSchema":{"type":"object","properties":{"name":{"type":"string"},"path":{"type":"string","description":"The file that defines the one you mean (optional)."}},"required":["name"]}}
 ]
 """;
 
@@ -354,6 +475,9 @@ fn serve_main(db_path: const u8[:]) {
             } else if name == "callers" {
                 let n = arg_text(targs, "name");
                 if n.len == 0 { payload.append("name is required"); ok = false; } else { callers(db, n, payload); }
+            } else if name == "touches" {
+                let n = arg_text(targs, "name");
+                if n.len == 0 { payload.append("name is required"); ok = false; } else { ok = touches(db, n, arg_text(targs, "path"), payload); }
             } else { payload.append("unknown tool: "); payload.append(name); ok = false; }
             out.append(",\"result\":{\"content\":[{\"type\":\"text\",\"text\":");
             json::format_string(out, payload);
@@ -414,6 +538,7 @@ fn main() {
     else if cmd == "find" && a.len == 4 { find_defs(db, a[3], out); }
     else if cmd == "neighbors" && a.len == 4 { ok = neighbors(db, a[3], out); }
     else if cmd == "callers" && a.len == 4 { callers(db, a[3], out); }
+    else if cmd == "touches" && (a.len == 4 || a.len == 5) { ok = touches(db, a[3], if a.len == 5 { a[4] } else { "" }, out); }
     else { usage(); }
     sqlite::close(db);
     out.push('\n');

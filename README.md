@@ -79,6 +79,7 @@ bin/spread-wings overview myrepo.db   # communities, main files, most-called nam
 bin/spread-wings find myrepo.db parse_config
 bin/spread-wings neighbors myrepo.db src/config.py
 bin/spread-wings callers myrepo.db parse_config
+bin/spread-wings touches myrepo.db parse_config   # before an edit: the files, tests and groups it reaches
 bin/spread-wings serve myrepo.db      # the same four tools over MCP (stdio)
 bin/spread-wings compiler myrepo.db ~/.local/share/swan/maps/myrepo/swan.db   # optional: compiler answers from a Swan map
 OPENROUTER_API_KEY=... bin/spread-wings decide myrepo.db   # optional: Span-02 decisions for calls still by_name

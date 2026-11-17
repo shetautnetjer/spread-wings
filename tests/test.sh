@@ -52,7 +52,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
   '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"find","arguments":{}}}' \
   | "$SW" serve "$db" > "$work/mcp.txt"
 check "mcp: four replies, each one valid JSON line (none for the notification)" "import json; ls=open('$work/mcp.txt').read().splitlines(); assert len(ls) == 4 and all(json.loads(l) for l in ls)"
-check "mcp: tools/list names the four tools" "import json; d=json.loads(open('$work/mcp.txt').read().splitlines()[1]); assert [t['name'] for t in d['result']['tools']] == ['overview','find','neighbors','callers']"
+check "mcp: tools/list names the five tools" "import json; d=json.loads(open('$work/mcp.txt').read().splitlines()[1]); assert [t['name'] for t in d['result']['tools']] == ['overview','find','neighbors','callers','touches']"
 check "mcp: find load returns web/store.ts" "import json; d=json.loads(open('$work/mcp.txt').read().splitlines()[2]); r=json.loads(d['result']['content'][0]['text']); assert any(x['path']=='web/store.ts' for x in r)"
 check "mcp: a missing argument is a tool error" "import json; d=json.loads(open('$work/mcp.txt').read().splitlines()[3]); assert d['result']['isError'] is True"
 
@@ -104,6 +104,11 @@ check "compiler: after a stale map, ping is still matched by name" "$(res "$work
 mkdir -p "$work/elsewhere"
 swan_map "$work/swan_other.db" "$work/elsewhere" 9000000000000000000
 check "compiler: a Swan map of another folder is an error" "import subprocess; r=subprocess.run(['$SW','compiler','$work/old.db','$work/swan_other.db'],capture_output=True,text=True); assert r.returncode != 0 and 'map the same folder' in r.stderr"
+
+# touches: what changing a definition reaches, in one answer.
+"$SW" touches "$db" total_area > "$work/touches.json"
+check "touches: total_area is defined in app/models.py, called from app/main.py and the test, one group" "$(J touches.json); assert [(f['path'], f['why'][0], f['is_test']) for f in d['files']] == [('app/models.py','defines it',False),('app/main.py','calls it',False),('tests/test_models.py','calls it',True)] and d['tests'] == ['tests/test_models.py'] and d['summary']['files'] == 3 and d['summary']['call_sites'] == 2 and d['summary']['matched_by_name_only'] == 0 and d['summary']['communities'] == 1"
+check "touches: a path narrows the name; an unknown name is an error" "import subprocess,json; d=json.loads(subprocess.check_output(['$SW','touches','$db','total_area','app/models.py'])); assert d['summary']['definitions'] == 1; r=subprocess.run(['$SW','touches','$db','no_such_name'],capture_output=True,text=True); assert r.returncode == 1 and 'no definition named' in r.stderr"
 
 # Review findings (2026-11-17), each one a case that was wrong before.
 q() { sqlite3 "$1" "$2"; }
