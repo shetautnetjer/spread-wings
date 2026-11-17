@@ -456,11 +456,22 @@ thread_fn extract_worker() {
                                         // `a, b = f()`, `for x in`, `with e as x`): the value
                                         // is unknown here. Where a call-form assign matched
                                         // the same statement, that one is kept (store step).
+                                        // A subscript target (`d[a, b] = v`) binds no name:
+                                        // its parts, up to the closing bracket, are skipped.
+                                        var in_sub = false;
                                         each_split(text, ',') { part =>
                                             var n = trim(part);
-                                            while n.len > 0 && (n[0] == '(' || n[0] == '[' || n[0] == '*') { n = trim(n[1..]); }
-                                            while n.len > 0 && (n[n.len - 1] == ')' || n[n.len - 1] == ']') { n = trim(n[..n.len - 1]); }
-                                            if n.len > 0 && find(n, ".") < 0 && callee_name(n) == n { record(done.data, "assign", n, "?", st, en, row); }
+                                            if in_sub {
+                                                if find(n, "]") >= 0 { in_sub = false; }
+                                            } else {
+                                                while n.len > 0 && (n[0] == '(' || n[0] == '[' || n[0] == '*') { n = trim(n[1..]); }
+                                                if find(n, "[") > 0 {
+                                                    if find(n, "]") < 0 { in_sub = true; }
+                                                } else {
+                                                    while n.len > 0 && (n[n.len - 1] == ')' || n[n.len - 1] == ']') { n = trim(n[..n.len - 1]); }
+                                                    if n.len > 0 && find(n, ".") < 0 && callee_name(n) == n { record(done.data, "assign", n, "?", st, en, row); }
+                                                }
+                                            }
                                         };
                                     } else if f[0] == "call" {
                                         let c = callee_name(text);

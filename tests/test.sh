@@ -132,6 +132,10 @@ eq "nested package: its three calls are linked, none marked external" "$(q "$wor
 want=$(grep -o '# want [a-z_]*' tests/fixtures/outside/app.py | sed 's/# want //' | paste -sd' ')
 got=$(q "$work/outside.db" "select group_concat(coalesce(c.note, (select group_concat(distinct e.resolution) from call_edges e where e.file_id = c.file_id and e.row = c.row), 'unlinked'), ' ') from (select * from calls where callee = 'render' order by row) c")
 eq "outside_object: the 12 cases in tests/fixtures/outside/app.py" "$got" "$want"
+mkdir -p "$work/sub"
+printf 'def f(d, a, b, rows):\n    d[a, b] = 1\n    x, d[0] = rows\n    [m, n] = rows\n    (p, q) = rows\n' > "$work/sub/t.py"
+"$SW" index "$work/sub" "$work/sub.db" >/dev/null
+eq "bindings: a subscript target binds no name; tuple and list targets bind theirs" "$(q "$work/sub.db" "select group_concat(name, ' ') from (select name from assigns order by row, name)")" "x m n p q"
 
 # decide: answers that can't be written are not used.
 mkdir -p "$work/dec/x"
