@@ -105,6 +105,63 @@ mkdir -p "$work/elsewhere"
 swan_map "$work/swan_other.db" "$work/elsewhere" 9000000000000000000
 check "compiler: a Swan map of another folder is an error" "import subprocess; r=subprocess.run(['$SW','compiler','$work/old.db','$work/swan_other.db'],capture_output=True,text=True); assert r.returncode != 0 and 'map the same folder' in r.stderr"
 
+# Review findings (2026-11-17), each one a case that was wrong before.
+q() { sqlite3 "$1" "$2"; }
+eq() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (got: $2)"; fi; }
+
+# A name defined in more than 50 places still links inside its own file.
+mkdir -p "$work/many"
+for i in $(seq 1 51); do printf 'def helper():\n    return %s\n\n\ndef use():\n    return helper()\n' "$i" > "$work/many/m$i.py"; done
+"$SW" index "$work/many" "$work/many.db" >/dev/null
+eq "common name: 51 files each calling their own helper() give 51 same_file links" "$(q "$work/many.db" "select resolution || ' ' || count(*) from call_edges group by resolution")" "same_file 51"
+
+# ES imports: a statement over several lines, and `./x.js` naming the file itself.
+"$SW" index tests/fixtures/esm "$work/esm.db" >/dev/null
+eq "esm: a multi-line import is read, at the row it starts on" "$(q "$work/esm.db" "select i.module, i.names, i.row, (select path from files where id = i.dst) from imports i join files f on f.id = i.file_id where f.path = 'index.ts'")" "./store|load,save|1|store.ts"
+eq "esm: its calls resolve through the import" "$(q "$work/esm.db" "select group_concat(distinct e.resolution) from call_edges e join files f on f.id = e.file_id where f.path = 'index.ts'")" "imported_name"
+eq "esm: './util.js' links to util.js" "$(q "$work/esm.db" "select (select path from files where id = i.dst) from imports i join files f on f.id = i.file_id where f.path = 'main.js'")" "util.js"
+
+# A Python package kept below another folder (python/mypkg).
+"$SW" index tests/fixtures/nested "$work/nested.db" >/dev/null
+eq "nested package: import mypkg.core finds python/mypkg/core.py, not python/other/core.py" "$(q "$work/nested.db" "select distinct (select path from files where id = i.dst) from imports i where i.module = 'mypkg.core'")" "python/mypkg/core.py"
+eq "nested package: its three calls are linked, none marked external" "$(q "$work/nested.db" "select group_concat(coalesce(c.note, (select e.resolution from call_edges e where e.file_id = c.file_id and e.row = c.row)), ' ') from (select * from calls order by row) c")" "imported_file module_alias imported_name"
+
+# outside_object: every binding counts, a type must end where the name ends,
+# a parameter hides a module-level variable, importlib under any name.
+"$SW" index tests/fixtures/outside "$work/outside.db" >/dev/null
+want=$(grep -o '# want [a-z_]*' tests/fixtures/outside/app.py | sed 's/# want //' | paste -sd' ')
+got=$(q "$work/outside.db" "select group_concat(coalesce(c.note, (select group_concat(distinct e.resolution) from call_edges e where e.file_id = c.file_id and e.row = c.row), 'unlinked'), ' ') from (select * from calls where callee = 'render' order by row) c")
+eq "outside_object: the 12 cases in tests/fixtures/outside/app.py" "$got" "$want"
+mkdir -p "$work/sub"
+printf 'def f(d, a, b, rows):\n    d[a, b] = 1\n    x, d[0] = rows\n    [m, n] = rows\n    (p, q) = rows\n' > "$work/sub/t.py"
+"$SW" index "$work/sub" "$work/sub.db" >/dev/null
+eq "bindings: a subscript target binds no name; tuple and list targets bind theirs" "$(q "$work/sub.db" "select group_concat(name, ' ') from (select name from assigns order by row, name)")" "x m n p q"
+
+# decide: answers that can't be written are not used.
+mkdir -p "$work/dec/x"
+printf 'def ping():\n    return 1\n' > "$work/dec/x/a.py"
+printf 'def ping():\n    return 2\n' > "$work/dec/x/b.py"
+printf 'def run(o, p):\n    o.ping()\n    o.ping(); p.ping()\n' > "$work/dec/x/c.py"
+"$SW" index "$work/dec" "$work/dec.db" >/dev/null
+fid=$(q "$work/dec.db" "select id from files where path = 'x/c.py'")
+a=$(q "$work/dec.db" "select s.id from symbols s join files f on f.id = s.file_id where f.path = 'x/a.py' and s.name = 'ping'")
+b=$(q "$work/dec.db" "select s.id from symbols s join files f on f.id = s.file_id where f.path = 'x/b.py' and s.name = 'ping'")
+q "$work/dec.db" "insert into decisions (file_id, row, callee, choice, target, p) values ($fid, 2, 'ping', 'd99999', 99999, 950), ($fid, 3, 'ping', 'd$a', $a, 950), ($fid, 3, 'ping', 'd$b', $b, 950)"
+out=$("$SW" decide-apply "$work/dec.db")
+eq "decide: an answer naming no offered definition, and two answers that differ on one line, are not used" "$out" "spread-wings decide-apply: 0 answers applied, 3 not used"
+eq "decide: those calls keep their by_name links" "$(q "$work/dec.db" "select resolution || ' ' || count(*) from call_edges group by resolution")" "by_name 6"
+q "$work/dec.db" "insert into decisions (file_id, row, callee, choice, target, p) values ($fid, 2, 'ping', 'd$b', $b, 950)"
+"$SW" decide-apply "$work/dec.db" >/dev/null
+eq "decide: a valid answer becomes the only link" "$(q "$work/dec.db" "select e.resolution, (select path from files where id = s.file_id) from call_edges e join symbols s on s.id = e.callee where e.row = 2")" "decided|x/b.py"
+check "decide: with nothing to ask, no key is needed" "import subprocess,os,time; e=dict(os.environ); e.pop('OPENROUTER_API_KEY',None); e['SPREAD_WINGS_CACHE']='$work/nocache'; t=time.time(); r=subprocess.run(['$SW','decide','$work/many.db'],capture_output=True,text=True,env=e); assert r.returncode == 0"
+"$SW" index "$work/dec" "$work/dec2.db" >/dev/null
+check "decide: with by_name calls and no key it stops at once, saying so" "import subprocess,os,time; e=dict(os.environ); e.pop('OPENROUTER_API_KEY',None); e['SPREAD_WINGS_CACHE']='$work/nocache'; t=time.time(); r=subprocess.run(['$SW','decide','$work/dec2.db'],capture_output=True,text=True,env=e); assert r.returncode != 0 and 'OPENROUTER_API_KEY is not set' in r.stderr and time.time() - t < 5, r.stderr"
+
+# A graph written by another version is refused with what to do.
+cp "$work/dec2.db" "$work/oldver.db"
+q "$work/oldver.db" "delete from meta where key = 'schema'"
+check "schema: a graph from another version says to rebuild it" "import subprocess; r=subprocess.run(['$SW','callers','$work/oldver.db','ping'],capture_output=True,text=True); assert r.returncode != 0 and 'rebuild it' in r.stderr, r.stderr"
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

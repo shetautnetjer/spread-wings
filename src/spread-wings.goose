@@ -78,7 +78,8 @@ fn index_main(repo_arg: const u8[:], db_path: const u8[:], gamma: f64) {
     let rounds = communities(db, gamma);
     set_meta(db, "root", repo);
     set_meta(db, "version", VERSION);
-    set_meta(db, "resolution", str(((gamma * 100.0) as i64)));
+    set_meta(db, "schema", SCHEMA_NUMBER);
+    set_meta(db, "resolution", str(((gamma * 100.0 + 0.5) as i64)));
     sqlite::exec_or_die(db, "COMMIT");
     let t2 = clock();
     print(str("spread-wings: ", n, " files, ", scalar(db, "SELECT COUNT(*) FROM symbols"), " definitions, ",
@@ -386,6 +387,10 @@ fn main() {
     if cmd == "serve" && a.len == 3 { serve_main(a[2]); return; }
     if cmd == "compiler" && a.len == 4 {
         compiler_main(a[2], a[3]);
+        return;
+    }
+    if cmd == "decide-apply" && a.len == 3 {
+        decide_apply_main(a[2]);
         return;
     }
     if cmd == "decide" {

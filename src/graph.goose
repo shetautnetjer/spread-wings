@@ -59,16 +59,40 @@ fn file_id(st: i64, path: const u8[:]) -> i64 {
 }
 
 // The first of the candidate paths that is an indexed file, else 0.
-fn first_file(st: i64, like_st: i64, candidates: const u8[:]) -> i64 {
+fn first_file(st: i64, like_st: i64, pkg_st: i64, candidates: const u8[:]) -> i64 {
     var found: i64 = 0;
     each_split(candidates, '\n') { c =>
         if found == 0 && c.len > 0 {
             // "%/x/src/lib.rs": any indexed path ending in /x/src/lib.rs.
-            if c[0] == '%' { found = file_id(like_st, c); } else { found = file_id(st, c); }
+            // ">pkg/mod.py": a path ending in /pkg/mod.py whose folder before
+            // it is not itself a Python package (see PKG_SUFFIX_SQL).
+            if c[0] == '%' { found = file_id(like_st, c); }
+            else if c[0] == '>' { found = file_id(pkg_st, c[1..]); }
+            else { found = file_id(st, c); }
         }
     };
     return found;
 }
+
+// A Python module below a folder that is a place imports start from: the
+// path ends in /<module path>, and the folder holding the module's first
+// segment has no __init__.py (if it had one, the module's real name would
+// start with that folder's). So `import mypkg.core` finds
+// python/mypkg/core.py, and does not find a/b/mypkg/core.py when a/b is a
+// package. pysuf holds every such ending of every Python path, so one
+// import is one indexed lookup; the shortest path wins.
+let PKG_SUFFIX_SQL = """
+    CREATE TEMP TABLE pysuf (suffix TEXT, id INTEGER, len INTEGER);
+    WITH RECURSIVE s(id, path, rest) AS (
+        SELECT id, path, substr(path, instr(path, '/') + 1) FROM files
+        WHERE lang = 'python' AND instr(path, '/') > 0
+        UNION ALL
+        SELECT id, path, substr(rest, instr(rest, '/') + 1) FROM s WHERE instr(rest, '/') > 0)
+    INSERT INTO pysuf SELECT rest, id, length(path) FROM s
+        WHERE NOT EXISTS (SELECT 1 FROM files g
+                          WHERE g.path = substr(s.path, 1, length(s.path) - length(s.rest)) || '__init__.py');
+    CREATE INDEX pysuf_suffix ON pysuf(suffix, len, id);
+""";
 
 // Candidate files for one import, best first, one per line.
 fn import_candidates(lang: const u8[:], importer: const u8[:], module: const u8[:], out: u8[>..]&) {
@@ -96,6 +120,13 @@ fn import_candidates(lang: const u8[:], importer: const u8[:], module: const u8[
         // A top-level package under src/ or the importer's own folder.
         format(out, "src/", base, ".py\n", "src/", base, "/__init__.py\n");
         if dir.len > 0 { format(out, dir, "/", base, ".py\n"); }
+        // A package kept in some other folder (python/mypkg, packages/x/mypkg):
+        // by its path below that folder. A lone module name (`import utils`)
+        // is tried only as a package, since any utils.py would match.
+        if up == 0 {
+            if find(base, "/") > 0 { format(out, ">", base, ".py\n"); }
+            format(out, ">", base, "/__init__.py\n");
+        }
         return;
     }
     if lang == "rust" {
@@ -153,6 +184,7 @@ fn import_candidates(lang: const u8[:], importer: const u8[:], module: const u8[
     var joined: u8[>..] = [];
     if dir.len > 0 { format(joined, dir, "/", module); } else { joined.append(module); }
     guard normalize(joined, base) else { return; }
+    format(out, base, "\n");   // `./store.js` naming the file itself
     for e in [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".d.ts", "/index.ts", "/index.tsx", "/index.js"] {
         format(out, base, e, "\n");
     }
@@ -174,6 +206,8 @@ fn link_imports(db: i64) -> i64 {
     let set_dst = sqlite::prepare_or_die(db, "UPDATE imports SET dst = ?2 WHERE rowid = ?1");
     let find_st = sqlite::prepare_or_die(db, "SELECT id FROM files WHERE path = ?1");
     let like_st = sqlite::prepare_or_die(db, "SELECT id FROM files WHERE path LIKE ?1 ORDER BY length(path) LIMIT 1");
+    sqlite::exec_or_die(db, PKG_SUFFIX_SQL);
+    let pkg_st = sqlite::prepare_or_die(db, "SELECT id FROM pysuf WHERE suffix = ?1 ORDER BY len, id LIMIT 1");
     let ins = sqlite::prepare_or_die(db, "INSERT INTO file_edges (src, dst, kind, weight) VALUES (?1, ?2, 'import', 1.0)");
     var n: i64 = 0;
     while sqlite::step(q, err) == 1 {
@@ -186,7 +220,7 @@ fn link_imports(db: i64) -> i64 {
         sqlite::col_text(q, 3, module);
         var cands: u8[>..] = [];
         import_candidates(lang, path, module, cands);
-        let dst = first_file(find_st, like_st, cands);
+        let dst = first_file(find_st, like_st, pkg_st, cands);
         var names: u8[>..] = [];
         sqlite::col_text(q, 5, names);
         // Names that stand for a whole module: `import a.b as x` and
@@ -203,7 +237,7 @@ fn link_imports(db: i64) -> i64 {
                     let bound = if gt > 0 { n[gt + 1..] } else { n };
                     var sub: u8[>..] = [];
                     import_candidates(lang, path, str(module, if module.len > 0 && module[module.len - 1] == '.' { "" } else { "." }, modname), sub);
-                    let mdst = first_file(find_st, like_st, sub);
+                    let mdst = first_file(find_st, like_st, pkg_st, sub);
                     if mdst != 0 && mdst != src && bound.len > 0 { add_alias(ins_alias, src, bound, mdst); }
                 }
             };
@@ -228,6 +262,8 @@ fn link_imports(db: i64) -> i64 {
     sqlite::finalize(q);
     sqlite::finalize(find_st);
     sqlite::finalize(like_st);
+    sqlite::finalize(pkg_st);
+    sqlite::exec_or_die(db, "DROP TABLE pysuf");
     sqlite::finalize(set_dst);
     sqlite::finalize(ins_alias);
     sqlite::finalize(ins);
@@ -252,11 +288,28 @@ fn link_calls(db: i64) {
         CREATE INDEX defs_name ON defs(name);
         CREATE TEMP TABLE ndefs AS SELECT name, COUNT(*) AS n FROM defs GROUP BY name;
         CREATE INDEX ndefs_name ON ndefs(name);
-        -- Candidate definitions per call site, for names defined in at most 50 places.
+        CREATE INDEX defs_name_file ON defs(name, sfile);
+        -- Candidate definitions per call site. A name defined in at most 50
+        -- places: all of them. A commoner name (`_write`, `main`, `run`): only
+        -- the definitions in the caller's own file and in files it imports,
+        -- which is all the import rules below can use. (Before, such a call
+        -- had no candidates at all, so even `helper()` beside `def helper`
+        -- went unlinked: 2,814 calls on Graphify's repo.)
         CREATE TEMP TABLE cands AS
             SELECT c.rowid AS cid, c.file_id AS cfile, c.callee AS name, d.sid, d.sfile, k.n
             FROM calls c JOIN ndefs k ON k.name = c.callee AND k.n <= 50
-            JOIN defs d ON d.name = c.callee;
+            JOIN defs d ON d.name = c.callee
+            UNION ALL
+            SELECT c.rowid, c.file_id, c.callee, d.sid, d.sfile, k.n
+            FROM calls c JOIN ndefs k ON k.name = c.callee AND k.n > 50
+            JOIN defs d ON d.name = c.callee AND d.sfile = c.file_id
+            UNION ALL
+            -- (CROSS JOIN keeps this order: the few common names first.)
+            SELECT DISTINCT c.rowid, c.file_id, c.callee, d.sid, d.sfile, k.n
+            FROM ndefs k CROSS JOIN calls c ON c.callee = k.name
+            CROSS JOIN imports i ON i.file_id = c.file_id AND i.dst > 0 AND i.dst <> c.file_id
+            CROSS JOIN defs d ON d.name = c.callee AND d.sfile = i.dst
+            WHERE k.n > 50;
         CREATE INDEX cands_cid ON cands(cid);
         CREATE TEMP TABLE chosen (cid INTEGER, sid INTEGER, resolution TEXT);
         CREATE TEMP TABLE done (cid INTEGER PRIMARY KEY);
@@ -363,22 +416,25 @@ fn link_calls(db: i64) {
             UNION SELECT DISTINCT replace(path, '.py', '') FROM files WHERE instr(path, '/') = 0
             UNION SELECT DISTINCT substr(substr(path, 5), 1, instr(substr(path, 5) || '/', '/') - 1)
                   FROM files WHERE path LIKE 'src/%'
+            -- every folder that is a Python package, wherever it is kept
+            UNION SELECT DISTINCT replace(d, rtrim(d, replace(d, '/', '')), '')
+                  FROM (SELECT substr(path, 1, length(path) - 12) AS d FROM files WHERE substr(path, -12) = '/__init__.py')
             UNION SELECT 'crate' UNION SELECT 'self' UNION SELECT 'super' UNION SELECT '';
-        CREATE TEMP TABLE ext (file_id INTEGER, name TEXT);
+        CREATE TEMP TABLE ext (file_id INTEGER, name TEXT, module TEXT);
         WITH RECURSIVE
             imp AS (SELECT file_id, module, COALESCE(names, '') AS names,
                            replace(replace(module, '::', '.'), '/', '.') || '.' AS m
                     FROM imports WHERE dst IS NULL OR dst = 0),
             outside AS (SELECT file_id, module, names, substr(m, 1, instr(m, '.') - 1) AS seg FROM imp
                         WHERE substr(m, 1, instr(m, '.') - 1) NOT IN (SELECT seg FROM roots)),
-            sp(file_id, name, rest) AS (
-                SELECT file_id, '', names || ',' FROM outside
-                UNION ALL SELECT file_id, substr(rest, 1, instr(rest, ',') - 1), substr(rest, instr(rest, ',') + 1)
+            sp(file_id, module, name, rest) AS (
+                SELECT file_id, module, '', names || ',' FROM outside
+                UNION ALL SELECT file_id, module, substr(rest, 1, instr(rest, ',') - 1), substr(rest, instr(rest, ',') + 1)
                 FROM sp WHERE rest <> '')
         INSERT INTO ext
-            SELECT file_id, CASE WHEN substr(name, 1, 1) = '@' THEN substr(name, 2) ELSE name END FROM sp
+            SELECT file_id, CASE WHEN substr(name, 1, 1) = '@' THEN substr(name, 2) ELSE name END, module FROM sp
             WHERE name <> '' AND instr(name, '>') = 0
-            UNION SELECT file_id, seg FROM outside WHERE names = '';
+            UNION SELECT file_id, seg, module FROM outside WHERE names = '';
         CREATE INDEX ext_file ON ext(file_id, name);
 
         -- A call through such a name (`shutil.rmtree`, `nx.Graph`, `patch(...)`):
@@ -412,33 +468,40 @@ fn link_calls(db: i64) {
 
         -- Variables holding outside objects: `G = nx.Graph()`, `m = re.match(...)`,
         -- `with open(p) as f`, `parser = ArgumentParser()`, or a parameter
-        -- typed `G: nx.Graph`. A variable counts only when every assignment
-        -- to it in that scope (its function, or module level) is from an
-        -- outside module, an outside name, a builtin or another such
-        -- variable. Two rounds, so `PAT = re.compile(...)` then
-        -- `m = PAT.match(...)` both count.
+        -- typed `G: nx.Graph`. A variable counts only when every binding of
+        -- it in that scope is from an outside module, an outside name, a
+        -- builtin or another such variable. Every binding: the extractor
+        -- also records the ones whose value it can't read (`x = other`, a
+        -- tuple target, `for x in`, `with e as x`, `except E as x`) with the
+        -- value `?`, which is never outside. The scope is the function; for
+        -- a module-level variable it is the whole file, since a function can
+        -- rebind it (`global x`). Two rounds, so `PAT = re.compile(...)`
+        -- then `m = PAT.match(...)` both count.
         CREATE TEMP TABLE asg AS SELECT file_id, in_symbol, name,
             CASE WHEN instr(value, '.') > 0 THEN substr(value, 1, instr(value, '.') - 1) ELSE value END AS vroot,
             instr(value, '.') = 0 AS bare
             FROM assigns;
         -- importlib.import_module / reload and __import__ return modules,
-        -- which can be this repo's own: never outside objects.
-        DELETE FROM ext WHERE name IN ('importlib', '__import__', 'import_module', 'reload');
+        -- which can be this repo's own: never outside objects, under any
+        -- name they were imported as (`import importlib as il`).
+        DELETE FROM ext WHERE name IN ('importlib', '__import__', 'import_module', 'reload')
+                           OR module = 'importlib' OR module LIKE 'importlib.%';
         CREATE INDEX asg_root ON asg(file_id, vroot);
         CREATE INDEX asg_scope ON asg(file_id, in_symbol, name);
+        CREATE INDEX asg_name ON asg(file_id, name, in_symbol);
         CREATE TEMP TABLE extvar (file_id INTEGER, in_symbol INTEGER, name TEXT);
         CREATE INDEX extvar_name ON extvar(file_id, name, in_symbol);
         INSERT INTO extvar SELECT DISTINCT a.file_id, a.in_symbol, a.name FROM asg a
-            WHERE NOT EXISTS (SELECT 1 FROM asg b WHERE b.file_id = a.file_id AND b.in_symbol = a.in_symbol
-                AND b.name = a.name
+            WHERE NOT EXISTS (SELECT 1 FROM asg b WHERE b.file_id = a.file_id AND b.name = a.name
+                AND (b.in_symbol = a.in_symbol OR a.in_symbol = 0)
                 AND NOT EXISTS (SELECT 1 FROM ext x WHERE x.file_id = b.file_id AND x.name = b.vroot)
                 AND NOT (b.bare AND b.vroot IN ('set', 'dict', 'list', 'tuple', 'str', 'int', 'float', 'bool', 'bytes', 'frozenset', 'open', 'sorted',
                        'reversed', 'map', 'filter', 'zip', 'enumerate', 'range', 'iter', 'type', 'object', 'super')
                          AND NOT EXISTS (SELECT 1 FROM defs d WHERE d.sfile = b.file_id AND d.name = b.vroot)));
         INSERT INTO extvar SELECT DISTINCT a.file_id, a.in_symbol, a.name FROM asg a
             WHERE NOT EXISTS (SELECT 1 FROM extvar v WHERE v.file_id = a.file_id AND v.in_symbol = a.in_symbol AND v.name = a.name)
-              AND NOT EXISTS (SELECT 1 FROM asg b WHERE b.file_id = a.file_id AND b.in_symbol = a.in_symbol
-                AND b.name = a.name
+              AND NOT EXISTS (SELECT 1 FROM asg b WHERE b.file_id = a.file_id AND b.name = a.name
+                AND (b.in_symbol = a.in_symbol OR a.in_symbol = 0)
                 AND NOT EXISTS (SELECT 1 FROM ext x WHERE x.file_id = b.file_id AND x.name = b.vroot)
                 AND NOT EXISTS (SELECT 1 FROM extvar v WHERE v.file_id = b.file_id AND v.name = b.vroot
                                 AND v.in_symbol IN (b.in_symbol, 0))
@@ -454,12 +517,17 @@ fn link_calls(db: i64) {
             EXISTS (SELECT 1 FROM extvar v WHERE v.file_id = calls.file_id
                     AND v.name = substr(text, 1, instr(text, '.') - 1)
                     AND (v.in_symbol = calls.in_symbol
+                         -- a module-level variable, unless the function has
+                         -- its own: a local binding, or a parameter of that name
                          OR (v.in_symbol = 0 AND NOT EXISTS (SELECT 1 FROM asg b WHERE b.file_id = calls.file_id
-                                AND b.in_symbol = calls.in_symbol AND b.name = v.name))))
+                                AND b.in_symbol = calls.in_symbol AND b.name = v.name)
+                             AND NOT EXISTS (SELECT 1 FROM symbols s WHERE s.id = calls.in_symbol AND s.sig IS NOT NULL
+                                AND s.sig GLOB '*[(, *]' || v.name || '[,:=) ]*'))))
+            -- a parameter typed with an outside name: `(G: nx.Graph`, `, g: Graph)`.
+            -- The type must end there: `g: GraphView` is not `Graph`.
             OR EXISTS (SELECT 1 FROM symbols s JOIN ext x ON x.file_id = s.file_id
                        WHERE s.id = calls.in_symbol AND s.sig IS NOT NULL
-                         AND (instr(s.sig, '(' || substr(text, 1, instr(text, '.') - 1) || ': ' || x.name) > 0
-                              OR instr(s.sig, ' ' || substr(text, 1, instr(text, '.') - 1) || ': ' || x.name) > 0)));
+                         AND s.sig GLOB '*[( ]' || substr(text, 1, instr(text, '.') - 1) || ': ' || x.name || '[^A-Za-z0-9_]*'));
         INSERT OR IGNORE INTO done SELECT rowid FROM calls WHERE note = 'outside_object';
 
         INSERT INTO chosen
