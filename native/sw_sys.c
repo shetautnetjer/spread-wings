@@ -33,6 +33,15 @@ bool sw_realpath(sw_slice path, gs_rref out) {
     return true;
 }
 
+/* When the file was last modified, in ns since the epoch; -1 if it cannot be
+   read. The compiler step compares it with the time a Swan map was built. */
+int64_t sw_mtime_ns(sw_slice path) {
+    char buf[4096];
+    struct stat st;
+    if (!to_cstr(path, buf, sizeof buf) || stat(buf, &st) != 0) return -1;
+    return (int64_t)st.st_mtim.tv_sec * 1000000000LL + (int64_t)st.st_mtim.tv_nsec;
+}
+
 /* mkdir -p, for the decision cache. */
 #include <errno.h>
 #include <sys/types.h>

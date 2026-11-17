@@ -60,26 +60,50 @@ check "mcp: a missing argument is a tool error" "import json; d=json.loads(open(
 # called on an object (so matched by name), and a hand-made Swan map that
 # resolves ping to x/b.py and pong to a library.
 mkdir -p "$work/c/x"
-printf 'def ping():\n    return 1\n\n\ndef pong():\n    return 1\n' > "$work/c/x/a.py"
-printf 'def ping():\n    return 2\n\n\ndef pong():\n    return 2\n' > "$work/c/x/b.py"
-printf 'def run(obj):\n    obj.ping()\n    obj.pong()\n' > "$work/c/x/c.py"
+printf 'def ping():\n    return 1\n\n\ndef pong():\n    return 1\n\n\ndef pang():\n    return 1\n\n\ndef peng():\n    return 1\n' > "$work/c/x/a.py"
+printf 'def ping():\n    return 2\n\n\ndef pong():\n    return 2\n\n\ndef pang():\n    return 2\n\n\ndef peng():\n    return 2\n' > "$work/c/x/b.py"
+printf 'def run(obj, other):\n    obj.ping()\n    obj.pong()\n    obj.pang(); other.pang()\n    obj.peng(); other.peng()\n' > "$work/c/x/c.py"
 "$SW" index "$work/c" "$work/c.db" >/dev/null
-python3 - "$work/swan.db" <<'PY'
+# A hand-made Swan map: ping -> x/b.py; pong -> a library; the two pang calls
+# on one line -> two different definitions; one answer (a library) for the
+# two peng calls on one line.
+swan_map() {  # swan_map <out.db> <root> <scip_time in ns>
+python3 - "$1" "$2" "$3" <<'PY'
 import sqlite3, sys
 d = sqlite3.connect(sys.argv[1])
 d.executescript("""
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE files (file TEXT PRIMARY KEY, hash TEXT, rows INTEGER, edited_mtime INTEGER);
 CREATE TABLE symbols (id INTEGER PRIMARY KEY, name TEXT, def_file TEXT, def_line INTEGER, in_repo INTEGER);
 CREATE TABLE occurrences (symbol_id INTEGER, file TEXT, start_line INTEGER, is_def INTEGER, by_name INTEGER, is_import INTEGER);
-INSERT INTO symbols VALUES (1, 'ping', 'x/b.py', 0, 1), (2, 'pong', NULL, NULL, 0);
-INSERT INTO occurrences VALUES (1, 'x/c.py', 1, 0, 0, 0), (2, 'x/c.py', 2, 0, 0, 0);
+INSERT INTO symbols VALUES (1, 'ping', 'x/b.py', 0, 1), (2, 'pong', NULL, NULL, 0),
+    (3, 'pang', 'x/a.py', 8, 1), (4, 'pang', 'x/b.py', 8, 1), (5, 'peng', NULL, NULL, 0);
+INSERT INTO occurrences VALUES (1, 'x/c.py', 1, 0, 0, 0), (2, 'x/c.py', 2, 0, 0, 0),
+    (3, 'x/c.py', 3, 0, 0, 0), (4, 'x/c.py', 3, 0, 0, 0), (5, 'x/c.py', 4, 0, 0, 0);
 """)
+d.execute("INSERT INTO meta VALUES ('root', ?), ('scip_time', ?)", (sys.argv[2], sys.argv[3]))
 d.commit()
 PY
-check "compiler: before Swan's answers, ping is matched by name" "import json,subprocess; d=json.loads(subprocess.check_output(['$SW','callers','$work/c.db','ping'])); assert {s['resolution'] for s in d['sites']} == {'by_name'}"
+}
+# Built "in the future", so no file counts as changed since.
+swan_map "$work/swan.db" "$work/c" 9000000000000000000
+res() { echo "import json,subprocess; d=json.loads(subprocess.check_output(['$SW','callers','$1','$2'])); r=sorted({(s['resolution'], s['defined_in']) for s in d['sites']})"; }
+check "compiler: before Swan's answers, ping is matched by name" "$(res "$work/c.db" ping); assert {x[0] for x in r} == {'by_name'}"
 "$SW" compiler "$work/c.db" "$work/swan.db" >/dev/null
-check "compiler: ping is tied to x/b.py, the definition the compiler names" "import json,subprocess; d=json.loads(subprocess.check_output(['$SW','callers','$work/c.db','ping'])); assert [(s['resolution'], s['defined_in']) for s in d['sites']] == [('compiler', 'x/b.py')]"
-check "compiler: pong, resolved outside the repo, keeps no guessed links" "import json,subprocess; d=json.loads(subprocess.check_output(['$SW','callers','$work/c.db','pong'])); assert [(s['resolution'], s['defined_in']) for s in d['sites']] == [('unlinked', '')]"
+check "compiler: ping is tied to x/b.py, the definition the compiler names" "$(res "$work/c.db" ping); assert r == [('compiler', 'x/b.py')]"
+check "compiler: pong, resolved outside the repo, keeps no guessed links" "$(res "$work/c.db" pong); assert r == [('unlinked', '')]"
+check "compiler: two calls on a line with different answers stay matched by name" "$(res "$work/c.db" pang); assert r == [('by_name', 'x/a.py,x/b.py')]"
+check "compiler: one answer does not speak for two calls on a line" "$(res "$work/c.db" peng); assert r == [('by_name', 'x/a.py,x/b.py')]"
 check "compiler: a missing Swan map is an error" "import subprocess; r=subprocess.run(['$SW','compiler','$work/c.db','$work/none.db'],capture_output=True); assert r.returncode != 0"
+# A map older than the files: nothing is taken from it, and the run says so.
+"$SW" index "$work/c" "$work/old.db" >/dev/null
+swan_map "$work/swan_old.db" "$work/c" 1
+check "compiler: files changed since the map was built are skipped, with a note" "import subprocess; o=subprocess.check_output(['$SW','compiler','$work/old.db','$work/swan_old.db'],text=True); assert '0 tied to one definition, 0 outside' in o and 'changed since the Swan map was built' in o"
+check "compiler: after a stale map, ping is still matched by name" "$(res "$work/old.db" ping); assert {x[0] for x in r} == {'by_name'}"
+# A map of some other folder is refused.
+mkdir -p "$work/elsewhere"
+swan_map "$work/swan_other.db" "$work/elsewhere" 9000000000000000000
+check "compiler: a Swan map of another folder is an error" "import subprocess; r=subprocess.run(['$SW','compiler','$work/old.db','$work/swan_other.db'],capture_output=True,text=True); assert r.returncode != 0 and 'map the same folder' in r.stderr"
 
 echo
 echo "$pass passed, $fail failed"
