@@ -33,7 +33,7 @@ trap cleanup EXIT
 t0=$(date +%s)
 cua sb fork "$checkpoint" "$name" >/dev/null
 { git ls-files -z; git ls-files -z -o --exclude-standard; } |
-  while IFS= read -r -d '' f; do [ -e "$f" ] && printf '%s\0' "$f"; done |
+  while IFS= read -r -d '' f; do if [ -e "$f" ]; then printf '%s\0' "$f"; fi; done |
   tar --null -T - -czf "$work/src.tgz"
 cua sb cp "$work/src.tgz" "$name:/tmp/src.tgz" >/dev/null
 # Out with the checkpoint's tracked files (so a file deleted here is gone
