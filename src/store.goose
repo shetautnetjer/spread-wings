@@ -14,7 +14,8 @@ CREATE TABLE IF NOT EXISTS files (
     community INTEGER, is_test INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS symbols (
     id INTEGER PRIMARY KEY, file_id INTEGER, name TEXT, kind TEXT,
-    row INTEGER, start INTEGER, end_ INTEGER, end_row INTEGER, sig TEXT, container TEXT);
+    row INTEGER, start INTEGER, end_ INTEGER, end_row INTEGER, sig TEXT, container TEXT,
+    params TEXT);   -- a function's parameter names, ",a,b,c," ("" for none): what its body binds on entry
 CREATE TABLE IF NOT EXISTS imports (file_id INTEGER, module TEXT, row INTEGER, names TEXT, dst INTEGER);
 CREATE TABLE IF NOT EXISTS calls (
     file_id INTEGER, row INTEGER, start INTEGER, callee TEXT, in_symbol INTEGER, text TEXT,
@@ -56,7 +57,7 @@ fn open_fresh(path: const u8[:]) -> i64 {
 // up whenever they change; a graph written with another number is rebuilt,
 // not read: indexing takes seconds, and a command that met a missing column
 // used to stop with a raw SQL error.
-let SCHEMA_NUMBER = "6";
+let SCHEMA_NUMBER = "7";
 
 fn open_map(path: const u8[:]) -> i64 {
     var err: u8[>..] = [];
