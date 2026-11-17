@@ -353,6 +353,115 @@ fn link_calls(db: i64) {
                           WHERE k.cid = calls.rowid);
         INSERT OR IGNORE INTO done SELECT rowid FROM calls WHERE note = 'builtin_method';
 
+        -- Names bound by an import from outside the repo (`import shutil`,
+        -- `import networkx as nx`, `from unittest.mock import patch`,
+        -- `use std::fs`, `import React from "react"`): an import with no file,
+        -- whose first segment isn't one of the repo's own top-level names.
+        CREATE TEMP TABLE roots AS
+            SELECT DISTINCT substr(path, 1, instr(path || '/', '/') - 1) AS seg FROM files
+            UNION SELECT DISTINCT replace(substr(path, 1, instr(path || '/', '/') - 1), '-', '_') FROM files
+            UNION SELECT DISTINCT replace(path, '.py', '') FROM files WHERE instr(path, '/') = 0
+            UNION SELECT DISTINCT substr(substr(path, 5), 1, instr(substr(path, 5) || '/', '/') - 1)
+                  FROM files WHERE path LIKE 'src/%'
+            UNION SELECT 'crate' UNION SELECT 'self' UNION SELECT 'super' UNION SELECT '';
+        CREATE TEMP TABLE ext (file_id INTEGER, name TEXT);
+        WITH RECURSIVE
+            imp AS (SELECT file_id, module, COALESCE(names, '') AS names,
+                           replace(replace(module, '::', '.'), '/', '.') || '.' AS m
+                    FROM imports WHERE dst IS NULL OR dst = 0),
+            outside AS (SELECT file_id, module, names, substr(m, 1, instr(m, '.') - 1) AS seg FROM imp
+                        WHERE substr(m, 1, instr(m, '.') - 1) NOT IN (SELECT seg FROM roots)),
+            sp(file_id, name, rest) AS (
+                SELECT file_id, '', names || ',' FROM outside
+                UNION ALL SELECT file_id, substr(rest, 1, instr(rest, ',') - 1), substr(rest, instr(rest, ',') + 1)
+                FROM sp WHERE rest <> '')
+        INSERT INTO ext
+            SELECT file_id, CASE WHEN substr(name, 1, 1) = '@' THEN substr(name, 2) ELSE name END FROM sp
+            WHERE name <> '' AND instr(name, '>') = 0
+            UNION SELECT file_id, seg FROM outside WHERE names = '';
+        CREATE INDEX ext_file ON ext(file_id, name);
+
+        -- A call through such a name (`shutil.rmtree`, `nx.Graph`, `patch(...)`):
+        -- not this repo's. Recorded on the call, not linked.
+        UPDATE calls SET note = 'external'
+        WHERE rowid IN (SELECT cid FROM cands)
+          AND rowid NOT IN (SELECT cid FROM done)
+          AND EXISTS (SELECT 1 FROM ext x WHERE x.file_id = calls.file_id AND x.name =
+                CASE WHEN instr(replace(COALESCE(text, callee), '::', '.'), '.') > 0
+                     THEN substr(replace(text, '::', '.'), 1, instr(replace(text, '::', '.'), '.') - 1)
+                     ELSE callee END);
+        INSERT OR IGNORE INTO done SELECT rowid FROM calls WHERE note = 'external';
+
+        -- A bare call to a Python builtin (`set()`, `len()`, `sorted()`) the
+        -- file neither defines nor imports.
+        UPDATE calls SET note = 'builtin'
+        WHERE rowid IN (SELECT cid FROM cands)
+          AND rowid NOT IN (SELECT cid FROM done)
+          AND instr(COALESCE(text, callee), '.') = 0
+          AND (SELECT lang FROM files WHERE id = calls.file_id) = 'python'
+          AND callee IN ('set', 'dict', 'list', 'tuple', 'str', 'int', 'float', 'bool', 'bytes', 'frozenset',
+                         'len', 'print', 'open', 'sorted', 'reversed', 'min', 'max', 'sum', 'any', 'all', 'map',
+                         'filter', 'zip', 'enumerate', 'range', 'isinstance', 'issubclass', 'getattr', 'setattr',
+                         'hasattr', 'delattr', 'type', 'iter', 'next', 'repr', 'round', 'abs', 'super', 'vars',
+                         'id', 'hash', 'format', 'input', 'object', 'property', 'staticmethod', 'classmethod',
+                         'divmod', 'pow', 'ord', 'chr', 'callable', 'exec', 'eval', 'compile', 'globals',
+                         'locals', 'dir', 'slice', 'bytearray', 'memoryview', 'complex')
+          AND NOT EXISTS (SELECT 1 FROM imports i WHERE i.file_id = calls.file_id
+                          AND (',' || i.names || ',') LIKE ('%,' || calls.callee || ',%'));
+        INSERT OR IGNORE INTO done SELECT rowid FROM calls WHERE note = 'builtin';
+
+        -- Variables holding outside objects: `G = nx.Graph()`, `m = re.match(...)`,
+        -- `with open(p) as f`, `parser = ArgumentParser()`, or a parameter
+        -- typed `G: nx.Graph`. A variable counts only when every assignment
+        -- to it in that scope (its function, or module level) is from an
+        -- outside module, an outside name, a builtin or another such
+        -- variable. Two rounds, so `PAT = re.compile(...)` then
+        -- `m = PAT.match(...)` both count.
+        CREATE TEMP TABLE asg AS SELECT file_id, in_symbol, name,
+            CASE WHEN instr(value, '.') > 0 THEN substr(value, 1, instr(value, '.') - 1) ELSE value END AS vroot,
+            instr(value, '.') = 0 AS bare
+            FROM assigns;
+        -- importlib.import_module / reload and __import__ return modules,
+        -- which can be this repo's own: never outside objects.
+        DELETE FROM ext WHERE name IN ('importlib', '__import__', 'import_module', 'reload');
+        CREATE INDEX asg_root ON asg(file_id, vroot);
+        CREATE INDEX asg_scope ON asg(file_id, in_symbol, name);
+        CREATE TEMP TABLE extvar (file_id INTEGER, in_symbol INTEGER, name TEXT);
+        CREATE INDEX extvar_name ON extvar(file_id, name, in_symbol);
+        INSERT INTO extvar SELECT DISTINCT a.file_id, a.in_symbol, a.name FROM asg a
+            WHERE NOT EXISTS (SELECT 1 FROM asg b WHERE b.file_id = a.file_id AND b.in_symbol = a.in_symbol
+                AND b.name = a.name
+                AND NOT EXISTS (SELECT 1 FROM ext x WHERE x.file_id = b.file_id AND x.name = b.vroot)
+                AND NOT (b.bare AND b.vroot IN ('set', 'dict', 'list', 'tuple', 'str', 'int', 'float', 'bool', 'bytes', 'frozenset', 'open', 'sorted',
+                       'reversed', 'map', 'filter', 'zip', 'enumerate', 'range', 'iter', 'type', 'object', 'super')
+                         AND NOT EXISTS (SELECT 1 FROM defs d WHERE d.sfile = b.file_id AND d.name = b.vroot)));
+        INSERT INTO extvar SELECT DISTINCT a.file_id, a.in_symbol, a.name FROM asg a
+            WHERE NOT EXISTS (SELECT 1 FROM extvar v WHERE v.file_id = a.file_id AND v.in_symbol = a.in_symbol AND v.name = a.name)
+              AND NOT EXISTS (SELECT 1 FROM asg b WHERE b.file_id = a.file_id AND b.in_symbol = a.in_symbol
+                AND b.name = a.name
+                AND NOT EXISTS (SELECT 1 FROM ext x WHERE x.file_id = b.file_id AND x.name = b.vroot)
+                AND NOT EXISTS (SELECT 1 FROM extvar v WHERE v.file_id = b.file_id AND v.name = b.vroot
+                                AND v.in_symbol IN (b.in_symbol, 0))
+                AND NOT (b.bare AND b.vroot IN ('set', 'dict', 'list', 'tuple', 'str', 'int', 'float', 'bool', 'bytes', 'frozenset', 'open', 'sorted',
+                       'reversed', 'map', 'filter', 'zip', 'enumerate', 'range', 'iter', 'type', 'object', 'super')
+                         AND NOT EXISTS (SELECT 1 FROM defs d WHERE d.sfile = b.file_id AND d.name = b.vroot)));
+
+        UPDATE calls SET note = 'outside_object'
+        WHERE rowid IN (SELECT cid FROM cands)
+          AND rowid NOT IN (SELECT cid FROM done)
+          AND instr(replace(COALESCE(text, ''), '::', '.'), '.') > 0
+          AND (
+            EXISTS (SELECT 1 FROM extvar v WHERE v.file_id = calls.file_id
+                    AND v.name = substr(text, 1, instr(text, '.') - 1)
+                    AND (v.in_symbol = calls.in_symbol
+                         OR (v.in_symbol = 0 AND NOT EXISTS (SELECT 1 FROM asg b WHERE b.file_id = calls.file_id
+                                AND b.in_symbol = calls.in_symbol AND b.name = v.name))))
+            OR EXISTS (SELECT 1 FROM symbols s JOIN ext x ON x.file_id = s.file_id
+                       WHERE s.id = calls.in_symbol AND s.sig IS NOT NULL
+                         AND (instr(s.sig, '(' || substr(text, 1, instr(text, '.') - 1) || ': ' || x.name) > 0
+                              OR instr(s.sig, ' ' || substr(text, 1, instr(text, '.') - 1) || ': ' || x.name) > 0)));
+        INSERT OR IGNORE INTO done SELECT rowid FROM calls WHERE note = 'outside_object';
+
         INSERT INTO chosen
             SELECT c.cid, c.sid, 'by_name' FROM cands c
             WHERE c.cid NOT IN (SELECT cid FROM done) AND c.n <= 8;
@@ -363,7 +472,7 @@ fn link_calls(db: i64) {
             FROM chosen ch JOIN calls c ON c.rowid = ch.cid;
 
         DROP TABLE defs; DROP TABLE ndefs; DROP TABLE cands; DROP TABLE chosen; DROP TABLE done;
-        DROP TABLE pend; DROP TABLE prov;
+        DROP TABLE pend; DROP TABLE prov; DROP TABLE roots; DROP TABLE ext; DROP TABLE asg; DROP TABLE extvar;
     """);
     call_file_edges(db);
 }

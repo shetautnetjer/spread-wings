@@ -45,7 +45,7 @@ rebuilt to be fast, local and honest about what it knows.
   decision model, typed questions about the calls the code alone can't tie
   down: which candidate definition, or "outside this repo", with
   probabilities, never free text. Rules learned from its answers settle most
-  calls first; on Graphify's repo a first run costs about a cent ($0.011), a
+  calls first; on Graphify's repo a first run costs about a fifth of a cent ($0.002), a
   re-index after a one-line edit $0.0002, and an unchanged one nothing (answers are cached
   by content; see [the design](docs/DESIGN.md)).
 

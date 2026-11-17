@@ -136,6 +136,9 @@ rule was checked against those cached answers before replacing them:
 | `module_alias`: `llm.f()` after `from graphify import llm`, `import a.b as x`, `import * as x`, Rust `use crate::m;` | 894 links | 675 agree, 4 differ |
 | `imported_name` through one re-export (`from graphify.__main__ import install`, defined in `install.py`) | part of 9,761 | 690 agree, 26 differ |
 | `imported_name` through up to three re-exports (`_file_stem`: test → `extract.py` → `extractors/base.py` → `ids.py`) and `module_alias` through a re-export (`extract._cpp_preprocess`, defined in `extractors/fortran.py`), plus `from pkg import mod as x` | 295 more links | 4 differ, Span-02 wrong in all 4 |
+| `external`: a call through a name bound by an import from outside the repo (`shutil.rmtree`, `nx.Graph`, a bare `patch(...)` from `unittest.mock`) | 875 calls | 715 agree, 0 differ |
+| `builtin`: a bare call to a Python builtin (`set()`, `len()`, `sorted()`) the file neither defines nor imports | 1,107 calls | 1,107 agree, 0 differ |
+| `outside_object`: a method call on a variable every assignment of which in that scope comes from an outside module, name, builtin or such variable (`G = nx.Graph()`, `m = PAT.match(...)`, `with open(p) as f`), or on a parameter typed with an outside name (`G: nx.Graph`). Modules from `importlib` don't count: they can be the repo's own | 766 calls | 117 agree, 0 differ, 2 Span-02 unsure (4 differed until `importlib` was excluded) |
 | `builtin_method`: a builtin method name (`get`, `items`, `join`, `resolve`, `push`, `unwrap`, ...) called on an object, with no candidate in a file the caller imports: not linked | 9,271 calls | 9,258 agree, 2 differ, 11 Span-02 unsure |
 
 Every difference sampled for the first two rules was Span-02 calling a
@@ -154,7 +157,8 @@ helps tell repo calls from library ones.
 |---|---|---|
 | First run, whole-function states, before the rules above | 13,712 | $0.157 |
 | First run, whole-function states, with them | 2,408 | $0.0177 |
-| First run, small windowed states, all rules (fresh cache) | 2,249 | **$0.0106** (1.15 M tokens, 37 s on 32 workers) |
+| First run, small windowed states, re-export rules (fresh cache) | 2,249 | $0.0106 (1.15 M tokens, 37 s on 32 workers) |
+| First run, plus `external`, `builtin`, `outside_object` (fresh cache) | 353 | **$0.0021** (227 k tokens, 6 s) |
 | After a one-line edit in one function | ~24 | ~$0.0002 |
 | Unchanged | 0 | $0 |
 
@@ -164,6 +168,13 @@ rules), 8 unsure, 8 different. Of the 8: four are re-exports the rules now
 follow (Span-02 had said "outside"), one is now right (`graph.query()` on a
 FalkorDB client, not a test helper), and three are calls through a local
 variable or a sample corpus file, where neither answer is exact.
+
+What is still asked is mostly method calls on variables whose type only a
+type checker knows: `G = build_from_json(...)` (a repo function returning a
+networkx graph, often without a return annotation), `client.get(...)` on a
+test client from a fixture. That is the boundary of syntax-only rules; the
+answer past it is a compiler-level map (Swan's SCIP indexes), not more
+rules.
 
 The cache folder can be moved with `SPREAD_WINGS_CACHE=<dir>`; an empty one
 measures a first run without touching the real cache.

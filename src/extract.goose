@@ -31,6 +31,8 @@ class	NAME	class $NAME: $$$B
 import	M	import $M
 import	M	from $M import $$$X
 call	F	$F($$$A)
+assign	X	$X = $F($$$A)
+assign	X	with $F($$$A) as $X: $$$B
 """;
     }
     if lang == "rust" {
@@ -72,6 +74,8 @@ class	NAME	class $NAME { $$$B }
 class	NAME	class $NAME extends $S { $$$B }
 import	M	require($M)
 call	F	$F($$$A)
+assign	X	const $X = $F($$$A)
+assign	X	let $X = $F($$$A)
 """;
     }
     // typescript, tsx
@@ -88,6 +92,8 @@ class	NAME	class $NAME implements $$$I { $$$B }
 interface	NAME	interface $NAME { $$$B }
 import	M	require($M)
 call	F	$F($$$A)
+assign	X	const $X = $F($$$A)
+assign	X	let $X = $F($$$A)
 """;
 }
 
@@ -223,6 +229,7 @@ fn extract_repo(db: i64, repo: const u8[:]) -> i64 {
     let ins_sym = sqlite::prepare_or_die(db, "INSERT INTO symbols (file_id, name, kind, row, start, end_, end_row, sig) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)");
     let ins_imp = sqlite::prepare_or_die(db, "INSERT INTO imports (file_id, module, row, names) VALUES (?1, ?2, ?3, ?4)");
     let ins_call = sqlite::prepare_or_die(db, "INSERT INTO calls (file_id, row, start, callee, in_symbol, text) VALUES (?1, ?2, ?3, ?4, 0, ?5)");
+    let ins_asg = sqlite::prepare_or_die(db, "INSERT INTO assigns (file_id, row, start, name, value, in_symbol) VALUES (?1, ?2, ?3, ?4, ?5, 0)");
     for i in 0..pids.len {
         let fid = pids[i];
         // Records: kind 0x1f a 0x1f b 0x1f start 0x1f end 0x1f row 0x1e
@@ -240,6 +247,14 @@ fn extract_repo(db: i64, repo: const u8[:]) -> i64 {
                 sqlite::bind_int(ins_imp, 3, row);
                 sqlite::bind_text(ins_imp, 4, f[2]);
                 sqlite::step_done(ins_imp);
+            } else if f[0] == "assign" {
+                sqlite::reset(ins_asg);
+                sqlite::bind_int(ins_asg, 1, fid);
+                sqlite::bind_int(ins_asg, 2, row);
+                sqlite::bind_int(ins_asg, 3, st);
+                sqlite::bind_text(ins_asg, 4, f[1]);
+                sqlite::bind_text(ins_asg, 5, f[2]);
+                sqlite::step_done(ins_asg);
             } else if f[0] == "call" {
                 sqlite::reset(ins_call);
                 sqlite::bind_int(ins_call, 1, fid);
@@ -268,6 +283,7 @@ fn extract_repo(db: i64, repo: const u8[:]) -> i64 {
     sqlite::finalize(ins_sym);
     sqlite::finalize(ins_imp);
     sqlite::finalize(ins_call);
+    sqlite::finalize(ins_asg);
     // Two patterns can match one definition (a const arrow and a call can
     // overlap): keep one row per place.
     sqlite::exec_or_die(db, """
@@ -286,6 +302,11 @@ fn extract_repo(db: i64, repo: const u8[:]) -> i64 {
         UPDATE calls SET in_symbol = COALESCE((
             SELECT s.id FROM symbols s
             WHERE s.file_id = calls.file_id AND s.start <= calls.start AND calls.start < s.end_
+              AND s.kind IN ('function', 'impl')
+            ORDER BY s.end_ - s.start LIMIT 1), 0);
+        UPDATE assigns SET in_symbol = COALESCE((
+            SELECT s.id FROM symbols s
+            WHERE s.file_id = assigns.file_id AND s.start <= assigns.start AND assigns.start < s.end_
               AND s.kind IN ('function', 'impl')
             ORDER BY s.end_ - s.start LIMIT 1), 0);
         -- A definition's own text also matches the call pattern in some
@@ -409,6 +430,13 @@ thread_fn extract_worker() {
                                             }
                                             let m = module_name(text);
                                             if m.len > 0 && names != "-" { record(done.data, "import", m, names, st, en, row); }
+                                        }
+                                    } else if f[0] == "assign" {
+                                        // `x = f(...)`: x holds what f returns (the
+                                        // value's call text, for the outside-object rule).
+                                        let v = capture(caps, "F");
+                                        if v.len > 0 && callee_name(text) == trim(text) {
+                                            record(done.data, "assign", trim(text), one_line(v, 120), st, en, row);
                                         }
                                     } else if f[0] == "call" {
                                         let c = callee_name(text);

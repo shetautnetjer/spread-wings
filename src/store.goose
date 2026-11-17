@@ -19,6 +19,9 @@ CREATE TABLE IF NOT EXISTS imports (file_id INTEGER, module TEXT, row INTEGER, n
 CREATE TABLE IF NOT EXISTS calls (
     file_id INTEGER, row INTEGER, start INTEGER, callee TEXT, in_symbol INTEGER, text TEXT,
     note TEXT);
+CREATE TABLE IF NOT EXISTS assigns (
+    file_id INTEGER, row INTEGER, start INTEGER, name TEXT, value TEXT, in_symbol INTEGER);
+CREATE INDEX IF NOT EXISTS assigns_scope ON assigns(file_id, name);
 CREATE TABLE IF NOT EXISTS aliases (file_id INTEGER, alias TEXT, dst INTEGER);
 CREATE TABLE IF NOT EXISTS file_edges (src INTEGER, dst INTEGER, kind TEXT, weight REAL);
 CREATE TABLE IF NOT EXISTS call_edges (
