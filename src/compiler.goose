@@ -69,6 +69,7 @@ fn compiler_main(db_path: const u8[:], swan_db: const u8[:]) {
             WHERE e.resolution = 'by_name'
             GROUP BY e.file_id, e.row, t.name;
         CREATE TEMP TABLE nsites AS SELECT COUNT(*) AS n FROM sites;
+        CREATE INDEX temp.sites_at ON sites (file_id, row, callee);
     """);
 
     // Files changed since the map's SCIP run: not answered from this map.
@@ -102,6 +103,12 @@ fn compiler_main(db_path: const u8[:], swan_db: const u8[:]) {
             JOIN sw.occurrences o ON o.file = st.path AND o.start_line = st.row - 1
                  AND o.is_def = 0 AND o.by_name = 0 AND o.is_import = 0
             JOIN sw.symbols s ON s.id = o.symbol_id AND s.name = st.callee;
+        -- The working tables are joined on (file, row, name) below, against
+        -- every edge and every call of the graph. Without these indexes each
+        -- of those joins scanned the whole table for every row: 77 s on
+        -- relatedb/relate (134,375 edges), under half a second with them,
+        -- for the same verdicts.
+        CREATE INDEX temp.hits_at ON hits (file_id, row, callee);
         -- target: 0 = outside the repo, an id = that one definition, -1 = left
         -- alone (fewer answers than calls on the line, answers that differ, or
         -- a repo symbol that is no definition here: a parameter or a variable
@@ -117,6 +124,7 @@ fn compiler_main(db_path: const u8[:], swan_db: const u8[:]) {
             FROM sites st JOIN hits h ON h.file_id = st.file_id AND h.row = st.row AND h.callee = st.callee
             GROUP BY st.file_id, st.row, st.callee;
         DELETE FROM verdict WHERE target < 0;
+        CREATE INDEX temp.verdict_at ON verdict (file_id, row, callee);
 
         DELETE FROM call_edges WHERE resolution = 'by_name' AND rowid IN (
             SELECT e.rowid FROM call_edges e JOIN symbols t ON t.id = e.callee
