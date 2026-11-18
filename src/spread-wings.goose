@@ -2,6 +2,7 @@
 //
 //   spread-wings index <repo> <graph.db>     parse, link by name, find communities
 //   spread-wings update <repo> <graph.db>    the same graph, from the files that changed
+//   spread-wings watch <repo> <graph.db>     stay awake and update it as files change
 //   spread-wings overview <graph.db>         communities and their main files
 //   spread-wings find <graph.db> <name>      definitions by name
 //   spread-wings neighbors <graph.db> <path> a file's imports and call links
@@ -52,13 +53,17 @@ spread-wings 0.1.0: a broad code graph from syntax alone
   spread-wings index <repo> <graph.db> [--resolution N]   (Louvain resolution, default 1.5)
   spread-wings update <repo> <graph.db> [--resolution N]  bring the graph up to date: reads only the files that
                                             changed, ties again only the calls they reach (builds it when it is not there)
+  spread-wings watch <repo> <graph.db> [--every S]        stay awake: update the graph when files change, and say on
+                                            one line each time what changed and what it reaches (looks every S seconds
+                                            besides, 30 by default; ends when the process that started it ends)
   spread-wings overview <graph.db>
   spread-wings find <graph.db> <name>
   spread-wings neighbors <graph.db> <path>
   spread-wings callers <graph.db> <name>
   spread-wings touches <graph.db> <name> [path]   what changing it reaches: files, tests, groups
   spread-wings serve <graph.db>
-  spread-wings compiler <graph.db> <swan.db>   compiler answers from a Swan map, for every call site it covers
+  spread-wings compiler <graph.db> <swan.db> [--into <copy.db>]   compiler answers from a Swan map, for every call
+                                            site it covers; with --into, put into a copy, the graph left as it is
   spread-wings survey <repo>                   the projects a repo holds: where, which package manager, which versions each wants
   spread-wings score <graph.db> <swan.db>      what the graph's definitions and links are worth against a Swan map
   spread-wings decide <graph.db> [--max N] [--workers N]   Span-02 decisions for calls still by_name
@@ -114,10 +119,9 @@ fn index_main(repo_arg: const u8[:], db_path: const u8[:], gamma: f64) {
 // graph cannot be brought up to date (none there; another layout or other
 // rules; another folder's; one holding answers from `compiler` or `decide`,
 // which sit on links update would redo), it is built whole, and the answer
-// says why. One JSON object.
-fn update_main(repo_arg: const u8[:], db_path: const u8[:], gamma_arg: f64) {
-    let repo = abs_dir(repo_arg);
-    guard is_dir(repo) else { abort(str("spread-wings: not a directory: ", repo)); }
+// says why. The answer, one JSON object, is appended to out; true when the
+// graph is not what it was (a file changed, or it was built whole).
+fn update_run(repo: const u8[:], db_path: const u8[:], gamma_arg: f64, out: u8[>..]&) -> bool {
     var why: u8[>..] = [];
     var gamma = if gamma_arg > 0.0 { gamma_arg } else { 1.5 };
     var regroup = false;
@@ -162,7 +166,7 @@ fn update_main(repo_arg: const u8[:], db_path: const u8[:], gamma_arg: f64) {
             }
         }
     }
-    var out: u8[>..] = [];
+    var changed = true;
     out.push('{');
     jstr(out, "root", repo);
     if why.len > 0 {
@@ -174,15 +178,110 @@ fn update_main(repo_arg: const u8[:], db_path: const u8[:], gamma_arg: f64) {
         out.push(',');
         jstr(out, "index", line);
     } else {
-        sqlite::exec_or_die(db, "BEGIN");
+        // One writer at a time: a second update of the same graph waits for
+        // the first (ten seconds at most) and then finds its work done.
+        sqlite::exec_or_die(db, "PRAGMA busy_timeout = 10000; BEGIN IMMEDIATE");
         out.append(",\"built_whole\":false,");
-        update_graph(db, repo, gamma, regroup, out);
+        changed = update_graph(db, repo, gamma, regroup, out);
         set_meta(db, "resolution", str(((gamma * 100.0 + 0.5) as i64)));
         sqlite::exec_or_die(db, "COMMIT");
         sqlite::close(db);
     }
-    out.append("}\n");
+    out.push('}');
+    return changed;
+}
+
+fn update_main(repo_arg: const u8[:], db_path: const u8[:], gamma_arg: f64) {
+    let repo = abs_dir(repo_arg);
+    guard is_dir(repo) else { abort(str("spread-wings: not a directory: ", repo)); }
+    var out: u8[>..] = [];
+    update_run(repo, db_path, gamma_arg, out);
+    out.push('\n');
     write_stdout(out);
+}
+
+extern fn sw_watch_open() -> i64;
+extern fn sw_watch_add(fd: i64, dir: const u8[:]) -> i32;
+extern fn sw_watch_wait(fd: i64, timeout_ms: i64) -> i32;
+
+// `watch`: stays awake and keeps the graph up to date. It sleeps until a
+// file event comes from one of the repo's folders (or `every` seconds
+// pass: a look that costs what an update with nothing changed costs), lets
+// the writing settle (until 200 ms pass with no event, two seconds at
+// most), and runs `update`. Each update that changed the graph is one line
+// on standard output, update's own answer with how it is watching; the
+// first line comes when the graph is up to date, changed or not, so a
+// reader knows the watcher is ready.
+//
+// The events only wake it. What changed is found by update, which looks at
+// every file, so a lost event delays a change until the next look and
+// never loses it. Without file events (not Linux, or the system's limit on
+// watched folders reached) it looks every two seconds.
+//
+// It watches a graph of the rules alone: compiler answers go into a copy
+// (`compiler --into`). It ends when the process that started it ends.
+fn watch_main(repo_arg: const u8[:], db_path: const u8[:], gamma_arg: f64, every: i64) {
+    let repo = abs_dir(repo_arg);
+    guard is_dir(repo) else { abort(str("spread-wings: not a directory: ", repo)); }
+    let fd = sw_watch_open();
+    var events = fd >= 0;
+    var first = true;
+    loop {
+        // The folders to watch, before the look: what is written while
+        // update runs is then an event for the next round. A folder made
+        // since the last round gets its watch here, and what was put in it
+        // before that is found by the update below.
+        if events {
+            var paths: u8[>..] = [];
+            var plangs: u8[>..] = [];
+            var dirs: u8[>..] = [];
+            walk_repo(repo, paths, plangs, dirs);
+            each_split(dirs, '\n') { d =>
+                if d.len > 0 && events && sw_watch_add(fd, d) < 0 { events = false; }
+            };
+        }
+        var out: u8[>..] = [];
+        let changed = update_run(repo, db_path, if first { gamma_arg } else { 0.0 }, out);
+        if first || changed {
+            var line: u8[>..] = [];
+            line.append("{\"watching\":");
+            if events { line.append("\"file events\""); } else { line.append("\"a look every 2 seconds\""); }
+            line.push(',');
+            line.append(out[1..]);
+            line.push('\n');
+            write_stdout(line);
+            flush_stdout();
+        }
+        first = false;
+        if events {
+            let r = sw_watch_wait(fd, every * 1000);
+            if r < 0 { events = false; }
+            if r > 0 {
+                let t = clock();
+                while clock() - t < 2.0 && sw_watch_wait(fd, 200) > 0 { }
+            }
+        } else {
+            sleep_ms(2000);
+        }
+    }
+}
+
+// A copy of a graph, for `compiler --into`: the graph as its last finished
+// write left it, read while a watcher may be writing the next.
+fn copy_graph(from: const u8[:], to: const u8[:]) {
+    guard find(to, "'") < 0 else { abort("spread-wings: the path of the copy cannot contain a quote"); }
+    guard from != to else { abort("spread-wings: --into names the graph itself"); }
+    let db = open_map(from);
+    delete_file(to);
+    delete_file(str(to, "-wal"));
+    delete_file(str(to, "-shm"));
+    sqlite::exec_or_die(db, str("PRAGMA busy_timeout = 10000; VACUUM INTO '", to, "'"));
+    sqlite::close(db);
+    var err: u8[>..] = [];
+    let c = sqlite::open_existing(to, err);
+    guard c != 0 else { abort(str("spread-wings: cannot write ", to, ": ", err)); }
+    sqlite::exec_or_die(c, "PRAGMA journal_mode = WAL");
+    sqlite::close(c);
 }
 
 // --- queries, as JSON ----------------------------------------------------------
@@ -618,6 +717,21 @@ fn main() {
     if cmd == "serve" && a.len == 3 { serve_main(a[2]); return; }
     if cmd == "compiler" && a.len == 4 {
         compiler_main(a[2], a[3]);
+        return;
+    }
+    if cmd == "compiler" && a.len == 6 && a[4] == "--into" {
+        copy_graph(a[2], a[5]);
+        compiler_main(a[5], a[3]);
+        return;
+    }
+    if cmd == "watch" && (a.len == 4 || (a.len == 6 && a[4] == "--every")) {
+        var every: i64 = 30;
+        if a.len == 6 {
+            let v, ok = parse_int(a[5]);
+            guard ok && v >= 1 && v <= 86400 else { abort("spread-wings: --every needs a number of seconds, 1 to 86400"); }
+            every = v;
+        }
+        watch_main(a[2], a[3], 0.0, every);
         return;
     }
     if cmd == "decide-apply" && a.len == 3 {

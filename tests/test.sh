@@ -339,6 +339,7 @@ eq "update: ... and the graph is as index left it" "$(as_index)" same
 top_line app/models.py '# a note'
 eq "graph_dump: a graph from before a change is not the one index builds after it" "$(as_index)" different
 check "update: a line added above a file's functions: the file is read again, and only its own calls are tied again" "$(U); assert d['changed'] == ['app/models.py'] and d['added'] == [] and d['removed'] == [] and d['files_with_calls_tied_again'] == ['app/models.py'] and 0 < d['calls_tied_again'] < d['calls'], d"
+check "update: ... the answer names the files that import or call into it, and the tests among them" "$(J u.json); assert d['reaches_files'] == 2 and d['reaches'] == ['app/main.py', 'tests/test_models.py'] and d['tests'] == ['tests/test_models.py'], d"
 eq "update: ... the call into it from another file keeps its link, now to the function's new row" "$(q "$ug" "select group_concat(e.resolution || '>' || s.name || '@' || s.row, ' ') from call_edges e join symbols s on s.id = e.callee join files f on f.id = e.file_id where f.path = 'app/main.py' and s.name = 'total_area'")" "imported_name>total_area@7"
 eq "update: ... and the graph is the one index builds" "$(as_index)" same
 
@@ -443,6 +444,67 @@ printf 'def c(x):\n    return str(x)\n' > "$fw/two.py"
 printf '# a note\ndef a(x):\n    return b(x)\n\n\ndef b(x):\n    return len(x)\n' > "$fw/one.py"
 check "update: a change that reaches most of the calls: all of them are tied again, and the answer says so" "import json,subprocess; d=json.loads(subprocess.check_output(['$SW','update','$fw','$fg'])); assert d['changed'] == ['one.py'] and d['all_calls_tied_again'] is True and d['calls_tied_again'] == d['calls'] == 3, d"
 eq "update: ... and the graph is the one index builds" "$(as_index_of "$fw" "$fg")" same
+
+# watch (2026-11-18): stays awake and runs update when files change; one
+# line for each update that changed the graph. --every 600 here, so that
+# only a file event can wake it within the test. It is started by a shell
+# of its own that lives until the checks are done: a watcher ends with the
+# process that started it.
+wr="$work/watch"; wg="$work/watch.db"; wl="$work/watch.lines"
+cp -r tests/fixtures/mini "$wr"
+( "$SW" watch "$wr" "$wg" --every 600 > "$wl" 2>"$work/watch.err" & echo $! > "$work/watch.pid"
+  while [ ! -e "$work/watch.done" ]; do sleep 0.2; done ) &
+wait_lines() { for _ in $(seq 1 100); do [ "$(wc -l < "$wl" 2>/dev/null || echo 0)" -ge "$1" ] && return 0; sleep 0.1; done; return 1; }
+WL() { echo "import json; L=[json.loads(l) for l in open('$wl')]; d=L[$1]"; }
+wait_lines 1
+check "watch: its first line says the graph is there and that file events wake it" "$(WL 0); assert d['watching'] == 'file events' and d['built_whole'] is True, d"
+printf '%s\n' '# a note' | cat - "$wr/app/models.py" > "$work/t" && cp "$work/t" "$wr/app/models.py"
+wait_lines 2
+check "watch: a file edited: a line names it, the files that import or call into it, and the tests among them" "$(WL 1); assert d['changed'] == ['app/models.py'] and d['reaches'] == ['app/main.py', 'tests/test_models.py'] and d['tests'] == ['tests/test_models.py'], d"
+mkdir "$wr/app/sub"; printf 'def fresh():\n    return 1\n' > "$wr/app/sub/new.py"
+wait_lines 3
+printf 'def fresh():\n    return 2\n\n\ndef more():\n    return fresh()\n' > "$wr/app/sub/new.py"
+wait_lines 4
+check "watch: a file in a folder made after the watcher started is seen when it is made, and again when it is edited" "$(WL 2); a=d; d=L[3]; assert a['added'] == ['app/sub/new.py'] and d['changed'] == ['app/sub/new.py'], (a, d)"
+echo hi > "$wr/notes.txt"; sleep 1
+eq "watch: a file of no known language makes no line" "$(wc -l < "$wl")" 4
+rm "$wr/app/util.py"
+wait_lines 5
+check "watch: a file removed: a line names it and the file that imported it" "$(WL 4); assert d['removed'] == ['app/util.py'] and d['reaches'] == ['app/main.py'], d"
+eq "watch: the graph it keeps is the one index builds" "$(as_index_of "$wr" "$wg")" same
+check "watch: it is alive while the process that started it is" "import os; os.kill(int(open('$work/watch.pid').read()), 0)"
+touch "$work/watch.done"
+check "watch: it ends when the process that started it ends" "
+import os, time
+pid = int(open('$work/watch.pid').read())
+for _ in range(100):
+    try: os.kill(pid, 0)
+    except ProcessLookupError: break
+    time.sleep(0.1)
+else: raise SystemExit(1)"
+kill "$(cat "$work/watch.pid")" 2>/dev/null   # (none is left when the check above passed)
+check "watch: a folder that is not there is an error" "import subprocess; r=subprocess.run(['$SW','watch','$work/nowhere','$wg'],capture_output=True,text=True,timeout=20); assert r.returncode != 0 and 'no such directory' in r.stderr, r.stderr"
+
+# Two updates of one graph at once (a watcher and a hand): the second waits
+# for the first and finds its work done.
+printf '%s\n' '# another note' | cat - "$wr/app/main.py" > "$work/t" && cp "$work/t" "$wr/app/main.py"
+"$SW" update "$wr" "$wg" > "$work/two_a.json" 2>"$work/two_a.err" &
+"$SW" update "$wr" "$wg" > "$work/two_b.json" 2>"$work/two_b.err"
+wait $!
+check "update: two at once: both end well, and one of them did the work" "import json; a=json.load(open('$work/two_a.json')); b=json.load(open('$work/two_b.json')); assert sorted([a['changed'], b['changed']]) == [[], ['app/main.py']], (a, b)"
+eq "update: ... and the graph is the one index builds" "$(as_index_of "$wr" "$wg")" same
+
+# compiler --into: Swan's answers go into a copy, and the graph stays one
+# of the rules alone, which update and watch can keep up to date.
+# (kinds.db: the rules graph of tests/fixtures/kinds; kindsc.db: a copy of
+# it that compiler was run on in place, with the same map.)
+cp "$work/kinds.db" "$work/kr.db"
+kr_before=$(dump "$work/kr.db")
+"$SW" compiler "$work/kr.db" "$work/swan_fix.db" --into "$work/kr_answers.db" > "$work/into.txt"
+eq "compiler --into: the graph it read is as it was" "$([ "$(dump "$work/kr.db")" = "$kr_before" ] && echo same || echo different)" same
+eq "compiler --into: the copy is the graph compiler leaves when run in place" "$([ "$(dump "$work/kr_answers.db")" = "$(dump "$work/kindsc.db")" ] && echo same || echo different)" same
+check "compiler --into: update still brings the graph up to date; the copy, which holds answers, it builds whole" "import json,subprocess; a=json.loads(subprocess.check_output(['$SW','update','tests/fixtures/kinds','$work/kr.db'])); b=json.loads(subprocess.check_output(['$SW','update','tests/fixtures/kinds','$work/kr_answers.db'])); assert a['built_whole'] is False and b['built_whole'] is True and 'compiler' in b['why'], (a, b)"
+check "compiler --into: the copy cannot be the graph itself" "import subprocess; r=subprocess.run(['$SW','compiler','$work/kr.db','$work/swan_fix.db','--into','$work/kr.db'],capture_output=True,text=True); assert r.returncode != 0 and 'the graph itself' in r.stderr, r.stderr"
 
 # What index writes for a repo carries a number (RULES_NUMBER): update
 # builds a graph whole when it was written under another. The fixtures'

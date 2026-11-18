@@ -66,6 +66,17 @@ let KEEP_OLD_SQL = """
         SELECT file_id, COALESCE(module, '') AS module, COALESCE(names, '') AS names, COALESCE(dst, 0) AS dst
         FROM imports WHERE file_id IN (SELECT id FROM temp.u_set);
     CREATE TEMP TABLE u_dsts (id INTEGER PRIMARY KEY);
+    -- The files with a link into one of them, as things stood (REACH_SQL).
+    CREATE TEMP TABLE u_reach (id INTEGER PRIMARY KEY);
+    INSERT OR IGNORE INTO temp.u_reach SELECT src FROM file_edges WHERE dst IN (SELECT id FROM temp.u_set);
+""";
+
+// What the change reaches: the files, not changed themselves, that import
+// or call into a file that changed, was added or is gone, before the
+// change or now. Where to look next, and the tests among them to run.
+let REACH_SQL = """
+    INSERT OR IGNORE INTO temp.u_reach SELECT src FROM file_edges WHERE dst IN (SELECT id FROM temp.u_set);
+    DELETE FROM temp.u_reach WHERE id IN (SELECT id FROM temp.u_set) OR id NOT IN (SELECT id FROM files);
 """;
 
 // The files something imports from, or names as a module (temp.u_dsts):
@@ -288,12 +299,14 @@ fn json_texts(db: i64, sql: const u8[:], out: u8[>..]&) {
 // up to date, and appends what it did to out as the members of a JSON
 // object. regroup: the communities are wanted at another resolution than
 // the graph has, so they are found again even when no file changed.
-fn update_graph(db: i64, repo: const u8[:], gamma: f64, regroup: bool, out: u8[>..]&) {
+// True when a file changed, was added or is gone.
+fn update_graph(db: i64, repo: const u8[:], gamma: f64, regroup: bool, out: u8[>..]&) -> bool {
     let now = time_ns();
     let t0 = clock();
     var paths: u8[>..] = [];
     var plangs: u8[>..] = [];
-    let n = walk_repo(repo, paths, plangs);
+    var walked: u8[>..] = [];
+    let n = walk_repo(repo, paths, plangs, walked);
     let all_paths = split(paths, '\n');
     let all_langs = split(plangs, '\n');
     var sizes: i64[>..] = [];
@@ -394,9 +407,9 @@ fn update_graph(db: i64, repo: const u8[:], gamma: f64, regroup: bool, out: u8[>
         format(out, "\"files\":", n, ",\"looked_at\":", which.len,
                ",\"changed\":[],\"added\":[],\"removed\":[],\"calls\":", calls_before,
                ",\"calls_tied_again\":0,\"all_calls_tied_again\":false,\"files_with_calls_tied_again\":[],\"files_grouped_again\":",
-               if regroup { "true" } else { "false" }, ",\"read_ms\":",
+               if regroup { "true" } else { "false" }, ",\"reaches_files\":0,\"reaches\":[],\"tests\":[],\"read_ms\":",
                ((clock() - t0) * 1000.0) as i64, ",\"link_ms\":0");
-        return;
+        return false;
     }
 
     let ins_ch = sqlite::prepare_or_die(db, "INSERT INTO temp.u_changed (id) VALUES (?1)");
@@ -486,6 +499,7 @@ fn update_graph(db: i64, repo: const u8[:], gamma: f64, regroup: bool, out: u8[>
         regrouped = regroup || set_changed || scalar(db, FILE_LINKS_SAME_SQL) != 0;
     }
     if regrouped { communities(db, gamma); }
+    sqlite::exec_or_die(db, REACH_SQL);
     let t2 = clock();
 
     let calls_now = scalar(db, "SELECT COUNT(*) FROM calls");
@@ -501,6 +515,16 @@ fn update_graph(db: i64, repo: const u8[:], gamma: f64, regroup: bool, out: u8[>
            ",\"files_with_calls_tied_again\":");
     if all_again { out.append("[]"); }
     else { json_texts(db, "SELECT path FROM files WHERE id IN (SELECT id FROM temp.dirty_files) ORDER BY path", out); }
+    // What the change reaches (at most 200 named; reaches_files counts them all).
     format(out, ",\"files_grouped_again\":", if regrouped { "true" } else { "false" },
-           ",\"read_ms\":", ((t1 - t0) * 1000.0) as i64, ",\"link_ms\":", ((t2 - t1) * 1000.0) as i64);
+           ",\"reaches_files\":", scalar(db, "SELECT COUNT(*) FROM temp.u_reach"), ",\"reaches\":");
+    json_texts(db, "SELECT path FROM files WHERE id IN (SELECT id FROM temp.u_reach) ORDER BY path LIMIT 200", out);
+    out.append(",\"tests\":");
+    json_texts(db, """
+        SELECT path FROM files WHERE is_test = 1
+          AND (id IN (SELECT id FROM temp.u_reach) OR id IN (SELECT id FROM temp.u_changed))
+        ORDER BY path LIMIT 200
+    """, out);
+    format(out, ",\"read_ms\":", ((t1 - t0) * 1000.0) as i64, ",\"link_ms\":", ((t2 - t1) * 1000.0) as i64);
+    return true;
 }

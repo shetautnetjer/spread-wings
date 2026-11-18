@@ -81,3 +81,55 @@ bool sw_mkdirs(sw_slice path) {
     }
     return mkdir(buf, 0700) == 0 || errno == EEXIST;
 }
+
+/* The watcher's wake-up: file events on the folders it was given, so that
+   it sleeps until something under one of them is written, made, moved or
+   removed. Only a wake-up: what changed is found by `update`, which looks
+   at every file, so an event lost or one too many costs nothing but a
+   look. Linux (inotify); elsewhere sw_watch_open says -1 and the watcher
+   looks on a timer. */
+#ifdef __linux__
+#include <poll.h>
+#include <signal.h>
+#include <sys/inotify.h>
+#include <sys/prctl.h>
+#include <unistd.h>
+
+/* A handle for sw_watch_add and sw_watch_wait, or -1. From here on this
+   process ends when the one that started it does: a watcher nobody reads
+   is not left running. */
+int64_t sw_watch_open(void) {
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+    int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    return fd < 0 ? -1 : fd;
+}
+
+/* Watches one folder (not the folders in it). 1: watched (a second time
+   is the same watch); 0: the folder is gone; -1: it cannot be watched (the
+   system's limit on watches is reached). */
+int32_t sw_watch_add(int64_t fd, sw_slice dir) {
+    char buf[4096];
+    if (fd < 0 || !to_cstr(dir, buf, sizeof buf)) return -1;
+    if (inotify_add_watch((int)fd, buf, IN_CLOSE_WRITE | IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVED_FROM |
+                          IN_MOVED_TO | IN_DELETE_SELF | IN_MOVE_SELF | IN_ONLYDIR) >= 0) return 1;
+    return (errno == ENOENT || errno == ENOTDIR) ? 0 : -1;
+}
+
+/* Waits up to timeout_ms for an event and takes every event that is
+   waiting. 1: there were events; 0: none came; -1: the handle is no good. */
+int32_t sw_watch_wait(int64_t fd, int64_t timeout_ms) {
+    if (fd < 0) return -1;
+    struct pollfd p = { .fd = (int)fd, .events = POLLIN };
+    int r;
+    do { r = poll(&p, 1, (int)timeout_ms); } while (r < 0 && errno == EINTR);
+    if (r == 0) return 0;
+    if (r < 0 || (p.revents & (POLLERR | POLLNVAL))) return -1;
+    union { char bytes[16384]; struct inotify_event align; } buf;
+    while (read((int)fd, buf.bytes, sizeof buf.bytes) > 0) { }
+    return 1;
+}
+#else
+int64_t sw_watch_open(void) { return -1; }
+int32_t sw_watch_add(int64_t fd, sw_slice dir) { (void)fd; (void)dir; return -1; }
+int32_t sw_watch_wait(int64_t fd, int64_t timeout_ms) { (void)fd; (void)timeout_ms; return -1; }
+#endif
