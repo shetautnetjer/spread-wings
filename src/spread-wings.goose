@@ -17,9 +17,11 @@ import sqlite from "shetautnetjer/goose-sqlite@c759de735ae936dcbc197bb9aae40e135
 import treesitter from "shetautnetjer/goose-treesitter@59313e9da0b9f1cce8df83cabe53ed73fa92345c";
 import .store;
 import .extract;
+import .treedefs;
 import .graph;
 import .decide;
 import .compiler;
+import .score;
 
 let VERSION = "0.1.0";
 
@@ -52,6 +54,7 @@ spread-wings 0.1.0: a broad code graph from syntax alone
   spread-wings touches <graph.db> <name> [path]   what changing it reaches: files, tests, groups
   spread-wings serve <graph.db>
   spread-wings compiler <graph.db> <swan.db>   compiler answers from a Swan map for calls still by_name
+  spread-wings score <graph.db> <swan.db>      what the graph's definitions and links are worth against a Swan map
   spread-wings decide <graph.db> [--max N] [--workers N]   Span-02 decisions for calls still by_name
                                             (OPENROUTER_API_KEY in the environment; default 5000 questions, 32 parallel requests)
 """);
@@ -255,7 +258,7 @@ fn callers(db: i64, name: const u8[:], out: u8[>..]&) {
     sqlite::bind_text(st, 1, name);
     out.append("{\"name\":");
     json::format_string(out, name);
-    out.append(",\"evidence\":\"each site's resolution says how it was tied to a definition: same_file, imported_name, module_alias or imported_file (import evidence), compiler (a Swan map), decided (Span-02, weight = probability), by_name (any definition with this name), or unlinked (a library, builtin or outside object)\",\"sites\":[");
+    out.append(",\"evidence\":\"each site's resolution says how it was tied to a definition: own_type or type_name (the type the call names: this.f(), Type.f()), same_file, imported_name, module_alias or imported_file (import evidence), compiler (a Swan map), decided (Span-02, weight = probability), by_name (any definition with this name), or unlinked (a library, builtin or outside object)\",\"sites\":[");
     var first = true;
     while sqlite::step(st, err) == 1 {
         if !first { out.push(','); }
@@ -515,6 +518,10 @@ fn main() {
     }
     if cmd == "decide-apply" && a.len == 3 {
         decide_apply_main(a[2]);
+        return;
+    }
+    if cmd == "score" && a.len == 4 {
+        score_main(a[2], a[3]);
         return;
     }
     if cmd == "decide" {

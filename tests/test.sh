@@ -3,7 +3,8 @@
 # graph, the CLI queries and the MCP server against known answers.
 set -uo pipefail
 cd "$(dirname "$0")/.."
-SW=bin/spread-wings
+# SPREAD_WINGS names another build to put through the same checks.
+SW=${SPREAD_WINGS:-bin/spread-wings}
 work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
 db="$work/mini.db"
 pass=0; fail=0
@@ -183,6 +184,81 @@ GQ() { echo "import sqlite3; c=sqlite3.connect('$work/goose.db')"; }
 check "goose: functions (nested and extern too), a struct and a top-level let, with their lines" "$(GQ); got=c.execute(\"select f.path,s.name,s.kind,s.row,s.end_row from symbols s join files f on f.id=s.file_id order by 1,4\").fetchall(); assert got == [('main.goose','UNIT','variable',6,6),('main.goose','Box','struct',8,8),('main.goose','main','function',10,19),('shapes.goose','c_helper','function',3,3),('shapes.goose','area','function',5,5),('shapes.goose','total_area','function',7,12),('shapes.goose','twice','function',8,10)], got"
 check "goose: comments, strings and raw strings hold no calls or definitions; methods and packages are not calls" "$(GQ); got=sorted(r[0] for r in c.execute(\"select callee from calls k join files f on f.id=k.file_id where f.path='main.goose'\")); assert got == ['print','str','total_area'], got"
 check "goose: import .shapes links main.goose to shapes.goose, and total_area resolves through it" "import json,subprocess; d=json.loads(subprocess.check_output(['$SW','neighbors','$work/goose.db','main.goose'])); assert d['imports'] == ['shapes.goose'], d; s=json.loads(subprocess.check_output(['$SW','callers','$work/goose.db','total_area']))['sites']; assert [(x['path'],x['line'],x['in'],x['defined_in']) for x in s] == [('main.goose',16,'main','shapes.goose')] and s[0]['resolution'] != 'by_name', s"
+
+# Definitions read from the syntax tree by node kind (2026-11-18): TypeScript,
+# TSX, JavaScript and Rust. tests/fixtures/kinds spells each definition in a
+# way the earlier list of shapes missed (0.1.0 found 18 of these 57), and
+# holds one call for each linking rule added with it.
+"$SW" index tests/fixtures/kinds "$work/kinds.db" >/dev/null
+defs() { q "$work/kinds.db" "select group_concat(x, ' ') from (select s.name || ':' || s.kind || ':' || s.row || coalesce(':' || s.container, '') as x from symbols s join files f on f.id = s.file_id where f.path = '$1' order by s.start)"; }
+eq "kinds: TypeScript: typed and generic arrow constants, a generator, a declared function, constants holding a call, an interface's and a class's methods, function-typed properties, enum, type" "$(defs web/shapes.ts)" \
+   "parse:function:2 load:function:5 steps:function:9 pick:function:13 ambient:function:19 useStore:function:21 run:function:23 Port:interface:26 close:function:27:Port onData:function:28:Port Session:class:32 onData:function:34:Session constructor:function:35:Session close:function:36:Session push:function:40:Session open:function:41:Session create:function:42:Session Color:enum:47 Handler:type:48 handle:function:48:Handler push:function:50 main:function:52"
+eq "kinds: the overloads of one function are one definition, from the first signature to the end of the body" "$(q "$work/kinds.db" "select row, end_row, sig from symbols where name = 'pick'")" "13|17|function pick(a: string): string;"
+eq "kinds: a constant holding a call's result that nothing calls, and a property that is no function, are not definitions" "$(q "$work/kinds.db" "select count(*) from symbols where name in ('unused', 'label')")" "0"
+eq "kinds: parameters: a constructor's 'private readonly id', past Rust's 'pub(crate)', and not a call's arguments" "$(q "$work/kinds.db" "select group_concat(name || coalesce(params, ''), ' ') from (select * from symbols where name in ('constructor', 'total', 'run') order by name)")" "constructor,id,name, run total,items,extra,"
+eq "kinds: Rust: pub(crate), tuple and unit structs, a union, generics and where clauses, an unsafe trait and its methods, const fn, extern fn, a type alias" "$(defs core/src/lib.rs)" \
+   "Pair:struct:4 Unit:struct:5 Bits:struct:6 Mode:enum:7 Sink:trait:8 put:function:9:Sink flush:function:10:Sink Shared:type:12 Pair:impl:14 put:function:15:Pair Pair:impl:18 new:function:19:Pair len:function:20:Pair twice:function:21:Pair inner:function:22:Pair total:function:25 helper:function:26 new_count:function:33 only_in_rust:function:35 len:function:37 flush:function:38 drive:function:40"
+eq "kinds: JavaScript: a class's methods, a private #method, a function expression and an arrow function held by const and var" "$(defs web/legacy.js)" "Cache:class:1 get:function:2:Cache make:function:3:Cache wrap:function:6 twice:function:7 boot:function:9 Vault:class:14 #seal:function:15:Vault unlock:function:16:Vault"
+eq "kinds: Rust 'pub(crate) mod store;' links lib.rs to store.rs" "$(q "$work/kinds.db" "select (select path from files where id = i.dst) from imports i where i.module = 'mod::store'")" "core/src/store.rs"
+# What a call is linked to, as rule>name@line[/container] for each link.
+linked() { q "$work/kinds.db" "select coalesce((select group_concat(e.resolution || '>' || s.name || '@' || s.row || coalesce('/' || s.container, ''), ' ') from call_edges e join symbols s on s.id = e.callee where e.file_id = c.file_id and e.row = c.row and s.name = c.callee), 'unlinked') from calls c join files f on f.id = c.file_id where f.path = '$1' and c.row = $2 and c.callee = '$3'"; }
+eq "links: a bare call reaches the plain function, not the method of that name (TypeScript)" "$(linked web/shapes.ts 55 push)" "same_file>push@50"
+eq "links: the same in Rust, for len() beside impl Pair's len" "$(linked core/src/lib.rs 43 len)" "same_file>len@37"
+eq "links: no call on an object is tied to a plain function, but through the module it is imported from" "$(q "$work/kinds.db" "select count(*) from call_edges e join symbols s on s.id = e.callee join calls c on c.file_id = e.file_id and c.row = e.row and c.callee = s.name where instr(c.text, '.') > 0 and coalesce(s.container, '') = '' and e.resolution <> 'module_alias'")" "0"
+eq "links: items.push() is tied to the method push only; list.steps() to nothing; steps() to the function, through the imported file" "$(linked web/shapes.ts 54 push), $(linked web/use.ts 8 steps), $(linked web/use.ts 9 steps)" "same_file>push@40/Session, unlinked, imported_file>steps@9"
+eq "links: shapes.pick() after 'import * as shapes' reaches the function" "$(linked web/use.ts 7 pick)" "module_alias>pick@13"
+eq "links: a method of an imported file is reached through an object (s.open())" "$(linked web/use.ts 6 open)" "imported_file>open@41/Session"
+eq "links: a TypeScript call is not tied to a Rust function of that name" "$(linked web/shapes.ts 58 only_in_rust)" "unlinked"
+eq "links: a call inside a method belongs to the method" "$(q "$work/kinds.db" "select s.name || '/' || s.container from calls c join symbols s on s.id = c.in_symbol where c.callee = 'run'")" "close/Session"
+eq "links: this.push() is the push of the calling method's own class" "$(linked web/shapes.ts 38 push)" "own_type>push@40/Session"
+eq "links: this.#seal() calls the private method #seal" "$(linked web/legacy.js 16 '#seal')" "own_type>#seal@15/Vault"
+eq "links: Session.create() and Cache.make() are the methods of the type named" "$(linked web/shapes.ts 57 create) $(linked web/legacy.js 11 make)" "type_name>create@42/Session type_name>make@3/Cache"
+eq "links: Vec::new() beside impl Pair's new is not Pair's; Pair::new() is" "$(linked core/src/lib.rs 27 new) $(linked core/src/lib.rs 28 new)" "unlinked type_name>new@19/Pair"
+eq "links: self.len() in impl Pair is Pair's len; LOGGER.put() is a call on a value, not on a type" "$(linked core/src/lib.rs 21 len) $(q "$work/kinds.db" "select qual from calls where callee = 'put' and text like 'LOGGER%'")" "own_type>len@20/Pair LOGGER"
+eq "links: the name before the call: this, a type under generic arguments, a field, none after a call" "$(q "$work/kinds.db" "select group_concat(text || '=' || coalesce(nullif(qual, ''), '-'), ' ') from (select distinct text, qual from calls where text in ('this.push', 'Pair::<u8>::new', 'self.0.len', 'text.split(\",\").map', 'push') order by text)")" "Pair::<u8>::new=Pair push=- self.0.len=0 text.split(\",\").map=- this.push=this"
+eq "links: a function nested in a function is no method, and its bare call reaches it" "$(q "$work/kinds.db" "select coalesce(container, 'none') from symbols where name = 'helper'") $(linked core/src/lib.rs 30 helper)" "none same_file>helper@26"
+
+# score: the graph beside a Swan map of the same code. A hand-made map says
+# where seven of the fixture's calls resolve (lines from 0), one of them
+# outside the repo and one to another file than the graph linked, and has
+# one definition the graph lacks.
+python3 - "$work/swan_kinds.db" "$(cd tests/fixtures/kinds && pwd -P)" <<'PY'
+import sqlite3, sys
+d = sqlite3.connect(sys.argv[1])
+d.executescript("""
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE files (file TEXT PRIMARY KEY, hash TEXT, rows INTEGER, edited_mtime INTEGER);
+CREATE TABLE symbols (id INTEGER PRIMARY KEY, name TEXT, kind TEXT, language TEXT, def_file TEXT, def_line INTEGER, in_repo INTEGER);
+CREATE TABLE occurrences (symbol_id INTEGER, file TEXT, start_line INTEGER, is_def INTEGER, by_name INTEGER, is_import INTEGER);
+INSERT INTO symbols VALUES
+    (1, 'parse', 'variable', 'typescript', 'web/shapes.ts', 1, 1),
+    (2, 'close', 'method', 'typescript', 'web/shapes.ts', 35, 1),
+    (3, 'close', 'method', 'typescript', 'web/shapes.ts', 26, 1),
+    (4, 'push', 'method', 'typescript', 'web/shapes.ts', 39, 1),
+    (5, 'push', 'method', 'typescript', NULL, NULL, 0),
+    (6, 'open', 'method', 'typescript', 'web/shapes.ts', 40, 1),
+    (7, 'missing', 'function', 'typescript', 'web/shapes.ts', 99, 1),
+    (8, 'flush', 'method', 'rust', 'core/src/store.rs', 3, 1),
+    (9, 'len', 'function', 'rust', 'core/src/lib.rs', 36, 1),
+    (10, '<constructor>', 'constructor', 'typescript', 'web/shapes.ts', 34, 1),
+    (11, '#seal', 'method', 'typescript', 'web/legacy.js', 14, 1);
+INSERT INTO occurrences VALUES
+    (3, 'web/shapes.ts', 52, 0, 0, 0), (5, 'web/shapes.ts', 53, 0, 0, 0), (4, 'web/shapes.ts', 37, 0, 0, 0),
+    (6, 'web/use.ts', 5, 0, 0, 0), (1, 'web/use.ts', 4, 0, 0, 0),
+    (8, 'core/src/lib.rs', 40, 0, 0, 0), (9, 'core/src/lib.rs', 42, 0, 0, 0);
+""")
+d.execute("INSERT INTO meta VALUES ('root', ?), ('scip_time', '9000000000000000000')", (sys.argv[2],))
+d.commit()
+PY
+"$SW" score "$work/kinds.db" "$work/swan_kinds.db" > "$work/score.json" 2>"$work/score.err"
+SC() { echo "import json; d=json.load(open('$work/score.json')); L={(r['language'], r['rule']): (r['links'], r['judged'], r['right'], r['other_file'], r['outside']) for r in d['links']}; D={(r['language'], r['kind']): (r['in_swan'], r['in_graph']) for r in d['definitions']}; C={(r['language'], r['kind']): (r['in_swan'], r['in_graph']) for r in d['called']}"; }
+check "score: links per language and rule: how many, how many Swan judges, right, in another file, outside the repo" "$(SC); assert L[('typescript', 'same_file')] == (6, 3, 2, 0, 1), L; assert L[('rust', 'same_file')] == (10, 2, 1, 1, 0), L; assert L[('typescript', 'own_type')] == (2, 1, 1, 0, 0) and L[('typescript', 'imported_name')] == (1, 1, 1, 0, 0) and L[('typescript', 'imported_file')] == (2, 1, 1, 0, 0) and L[('typescript', 'module_alias')] == (1, 0, 0, 0, 0) and L[('javascript', 'type_name')] == (1, 0, 0, 0, 0), L"
+check "score: a call linked to two candidates is one call judged, with the right link among them" "import json; d=json.load(open('$work/score.json')); r=[x for x in d['links'] if (x['language'], x['rule']) == ('typescript', 'same_file')][0]; assert (r['calls_judged'], r['calls_with_the_right_link']) == (2, 1), r"
+check "score: definitions Swan has and the graph has at the same place, per language and kind (Swan's <constructor> is the graph's constructor)" "$(SC); assert D == {('typescript', 'method'): (5, 5), ('typescript', 'constructor'): (1, 1), ('typescript', 'function'): (1, 0), ('rust', 'method'): (1, 1), ('rust', 'function'): (1, 1)}, D"
+check "score: the same for the definitions the repo's calls reach, a constant holding a function among them" "$(SC); assert C == {('typescript', 'method'): (3, 3), ('typescript', 'variable'): (1, 1), ('rust', 'method'): (1, 1), ('rust', 'function'): (1, 1)}, C"
+check "score: nothing is written to the graph" "import subprocess; a=subprocess.check_output(['sqlite3','$work/kinds.db','select count(*), group_concat(distinct resolution) from call_edges; select count(*) from symbols'],text=True); subprocess.check_call(['$SW','score','$work/kinds.db','$work/swan_kinds.db'],stdout=subprocess.DEVNULL); b=subprocess.check_output(['sqlite3','$work/kinds.db','select count(*), group_concat(distinct resolution) from call_edges; select count(*) from symbols'],text=True); assert a == b"
+check "score: a Swan map whose symbols carry no kind is refused, saying to rebuild it" "import subprocess; r=subprocess.run(['$SW','score','$work/c.db','$work/swan.db'],capture_output=True,text=True); assert r.returncode != 0 and 'no kind and language' in r.stderr, r.stderr"
+check "score: a Swan map of another folder is an error" "import subprocess; r=subprocess.run(['$SW','score','$work/kinds.db','$work/swan_other.db'],capture_output=True,text=True); assert r.returncode != 0 and 'map the same folder' in r.stderr, r.stderr"
 
 echo
 echo "$pass passed, $fail failed"

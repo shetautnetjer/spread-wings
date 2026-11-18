@@ -40,7 +40,15 @@ together: Spread-Wings to find the area, Swan to answer inside it.
      `crate::`, `self::`, `super::` and workspace crates by name (`foo_bar`
      is a `foo-bar/src/lib.rs`).
    - Each call site is placed in the innermost definition that spans it.
+   - Candidates are cut first by what the call's own form rules out: a
+     definition in another language; a method, for a bare call; a plain
+     function, for a call on an object (Rust, TypeScript, JavaScript; not
+     when the object is the imported module); and, when the call names a
+     type none of the candidates belongs to (`Vec::new()`), the methods of
+     other types.
    - Each call is tied to definitions by the first rule that applies:
+     `own_type` (`this.f()`, `self.f()`, `Self::f()`: the f of the type the
+     calling method belongs to); `type_name` (`Type::f()`, `Type.f()`);
      `same_file`; `imported_name` (the caller's file imports that name, as
      `from m import f`, `import { f } from "./m"` or `use m::{F}`, from a file
      defining it); `imported_file` (it imports a file defining it);
