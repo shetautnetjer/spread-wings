@@ -105,19 +105,34 @@ numbers).
 | `update`, a folder of 149 test files moved | 5.6 s |
 
 It answers with one JSON object: the files changed, added and removed, how
-many calls were tied again, and the files they are in. With no graph there
-it builds one. A graph it cannot bring up to date (written by another
-version; one holding answers from `compiler` or `decide`, which sit on links
-it would redo) is built whole, and the answer says why.
+many calls were tied again and the files they are in, and what the change
+reaches: the files that import or call into a changed file, and the tests
+among them. With no graph there it builds one. A graph it cannot bring up
+to date (written by another version; one holding answers from `compiler` or
+`decide`, which sit on links it would redo) is built whole, and the answer
+says why.
+
+`spread-wings watch <repo> <graph.db>` stays awake and does this whenever
+files change. It sleeps on file events from the repo's folders, lets the
+writing settle, runs `update`, and prints one line (update's answer) for
+each change. On rea a line follows an edit by half a second; asleep, the
+watcher holds 10 MB and uses a thousandth of a processor (one look every
+30 seconds, in case an event was missed). It ends when the process that
+started it ends.
+
+A watched graph is one of the rules alone. `spread-wings compiler <graph.db>
+<swan.db> --into <copy.db>` puts Swan's answers into a copy and leaves the
+graph as it is, so the two go together: the watcher keeps the graph, and the
+copy is made again when the graph or the map has changed.
 
 ## With Swan
 
 Spread-Wings ships inside [Swan](https://github.com/shetautnetjer/Swan) as a
 pinned submodule, and the two split the work on one line: what can be
 learned by only reading files is Spread-Wings (the survey of a repo's
-projects, the broad map, bringing it up to date from the files that changed
-and, to come, watching for changes and pointing Swan at what needs a precise
-look); what needs a compiler-grade tool to run
+projects, the broad map, watching for changes, bringing the map up to date
+from the files that changed and saying what a change reaches, which is where
+Swan needs a precise look); what needs a compiler-grade tool to run
 is Swan (exact references, renames, errors, edits, tests). Swan's answers
 come back into the graph through `compiler`, and `score` grades the graph
 against them. The agreed order of work is in Swan's `docs/wings-and-swan.md`.
@@ -128,6 +143,7 @@ against them. The agreed order of work is in Swan's `docs/wings-and-swan.md`.
 scripts/build.sh                      # needs the Goose compiler (GOOSE=/path/to/goose)
 bin/spread-wings index ~/code/myrepo myrepo.db              # --resolution 2 for smaller communities
 bin/spread-wings update ~/code/myrepo myrepo.db             # after edits: the same graph, from the files that changed
+bin/spread-wings watch ~/code/myrepo myrepo.db              # stay awake: update on every change, one line each
 bin/spread-wings overview myrepo.db   # communities, main files, most-called names
 bin/spread-wings find myrepo.db parse_config
 bin/spread-wings neighbors myrepo.db src/config.py
@@ -136,6 +152,7 @@ bin/spread-wings touches myrepo.db parse_config   # before an edit: the files, t
 bin/spread-wings survey ~/code/myrepo             # the projects it holds: where, which package manager, which versions each wants
 bin/spread-wings serve myrepo.db      # the same four tools over MCP (stdio)
 bin/spread-wings compiler myrepo.db ~/.local/share/swan/maps/myrepo/swan.db   # optional: Swan's answer for every call site its map covers
+bin/spread-wings compiler myrepo.db ~/.local/share/swan/maps/myrepo/swan.db --into answered.db   # the same, into a copy
 bin/spread-wings score myrepo.db ~/.local/share/swan/maps/myrepo/swan.db      # what the definitions and links are worth, per language and rule, against that map
 OPENROUTER_API_KEY=... bin/spread-wings decide myrepo.db   # optional: Span-02 decisions for calls still by_name
 ```
@@ -169,9 +186,12 @@ All output is JSON.
   right on the four test repos); `decide` asks a model about the rest.
 - TypeScript: keys of an object literal that hold a function, namespaces
   and JSX element use (`<Panel />`) are not read.
-- `update` keeps a graph of the rules alone. Answers from `compiler` or
-  `decide` are not kept through it: such a graph is built whole, and the
-  step has to be run again.
+- `update` and `watch` keep a graph of the rules alone. Answers from
+  `compiler` go into a copy (`--into`), made again whole after a change
+  (1.1 s on relate); `decide` has no such copy yet, and a graph it has
+  written to is built whole.
+- `watch` wakes on file events on Linux. Elsewhere, or past the system's
+  limit on watched folders, it looks every two seconds.
 
 ## Documents
 

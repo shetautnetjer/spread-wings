@@ -318,3 +318,85 @@ Limits:
 - Row numbers in an updated graph are not those of a fresh one. Nothing in
   Spread-Wings reads meaning into them; `decide` asks its questions in
   row order, so under `--max` it may ask a different subset.
+
+## 2026-11-18: `watch`, what a change reaches, and compiler answers into a copy
+
+`update` made a graph cheap to bring up to date; something still had to run
+it, and Swan's graph could not use it, since Swan's answers (`compiler`)
+were written into the graph `update` would have to redo.
+
+- `spread-wings watch <repo> <graph.db>` stays awake. It sleeps on file
+  events from every folder of the walk, waits for the writing to settle
+  (200 ms with no event, two seconds at most), runs `update`, and prints
+  one line for each update that changed the graph. The events only wake
+  it: what changed is found by `update`, which looks at every file, so a
+  lost event delays a change until the next look (every 30 seconds,
+  `--every`) and never loses it. A folder made later is watched from the
+  next round. It ends when the process that started it ends.
+- `update`'s answer, and so each line of `watch`, says what the change
+  reaches: the files, not changed themselves, that import or call into a
+  file that changed, was added or is gone (`reaches`, at most 200 named,
+  `reaches_files` counts them), and the tests among them and among the
+  changed files (`tests`).
+- `spread-wings compiler <graph.db> <swan.db> --into <copy.db>` puts Swan's
+  answers into a copy and leaves the graph as it is. The copy is the graph
+  `compiler` leaves when run in place.
+- Two updates of one graph at once no longer end in "database is locked":
+  the second waits for the first (ten seconds at most) and finds its work
+  done.
+
+| rea (7,784 files, 655 folders) | |
+|---|---|
+| From an edit to the line that reports it | 0.5 s (0.2 s of that is waiting for the writing to settle) |
+| Asleep for 30 s | 30 ms of processor time (the one timed look), 10 MB of memory |
+| The copy alone (`VACUUM INTO`, 110 MB) | 0.1 s |
+
+| relate | |
+|---|---|
+| `compiler` in place | 1.3 s |
+| `compiler --into` | 1.1 s |
+
+Checked:
+- 16 new checks, 173 pass in the microVM
+  (`SW_SPACE_CHECKPOINT=swan-test-v4 scripts/space-test.sh`): a watcher on
+  a copy of the mini fixture, woken only by events (`--every 600`): its
+  first line; a file edited, with what it reaches and the tests; a file in
+  a folder made after it started, when made and when edited; a file of no
+  known language (no line); a file removed, with the file that imported
+  it; the graph it keeps against a fresh one; that it ends with the
+  process that started it. `--into`: the graph untouched, the copy equal to
+  compiler run in place, the graph still updatable and the copy not. Two
+  updates at once: both end well, one did the work.
+- Seen failing on builds with the fault: watches added only at the start
+  (the edit in the new folder is missed); the tie to the starting process
+  left out (the watcher lives on); `--into` writing to the graph itself;
+  the files linking to a removed file not noted before its rows go (the
+  removal reaches nothing). On the build before this one 12 of the first
+  14 fail; the other two hold without a watcher. The two-at-once check was
+  not seen failing: on a small repo the two rarely overlap. The fault it
+  is there for was seen by hand on rea ("database is locked").
+- `index` writes the graphs it wrote before: relate, Understand-Anything
+  and Agent-Reach against the build of 7beddf2, by dump.
+- `tests/random_changes.py`, since `update` was touched: 116 rounds on
+  Agent-Reach, Understand-Anything and relate, none differing from
+  `index`.
+
+Limits:
+- Swan does not read it yet. That is the next change, in Swan: its broad
+  map from a graph that follows the files, with `compiler --into` for its
+  answers, and what a change reaches passed on.
+- The copy with compiler answers is made whole each time, after any
+  change, before the first question that needs it: 1.1 s on relate. On
+  rea the copy itself is 0.1 s and the compiler step was 3.4 s when last
+  measured (the `compiler` entry above); the two were not timed together, as this
+  machine holds no Swan map of rea now.
+- File events are Linux's (inotify). The system's limit on watches
+  (`fs.inotify.max_user_watches`) counts every folder; past it the watcher
+  says so on its lines (`"watching":"a look every 2 seconds"`) and looks
+  on a timer.
+- A storm of writes (a build writing into a watched folder) has it update
+  every two seconds for as long as the storm lasts.
+- It ends with the process that started it, so it cannot be left running
+  from a shell that then closes; under a service manager it lives as long
+  as the service.
+- `decide` answers have no `--into`.

@@ -163,10 +163,11 @@ extern fn sw_file_size(path: const u8[:]) -> i64;
 // The walk: every supported file below repo, as absolute paths and their
 // languages, one per line each, in the order index has always met them (a
 // folder's own files by name, then the folders found, in the order found).
-// Returns how many.
-fn walk_repo(repo: const u8[:], paths: u8[>..]&, plangs: u8[>..]&) -> i64 {
+// `dirs` (empty on entry) comes back holding every folder walked, one per
+// line, the repo first: the folders the watcher watches. Returns how many
+// files.
+fn walk_repo(repo: const u8[:], paths: u8[>..]&, plangs: u8[>..]&, dirs: u8[>..]&) -> i64 {
     var count: i64 = 0;
-    var dirs: u8[>..] = [];
     dirs.append(repo);
     dirs.push('\n');
     var next = 0;
@@ -408,7 +409,8 @@ fn extract_repo(db: i64, repo: const u8[:]) -> i64 {
     let now = time_ns();
     var paths: u8[>..] = [];
     var plangs: u8[>..] = [];
-    let n = walk_repo(repo, paths, plangs);
+    var walked: u8[>..] = [];
+    let n = walk_repo(repo, paths, plangs, walked);
     let all_paths = split(paths, '\n');
     let all_langs = split(plangs, '\n');
     var pids: i64[>..] = [];

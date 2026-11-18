@@ -8,9 +8,9 @@ is ever run). Read [docs/DESIGN.md](docs/DESIGN.md) first.
 | `src/spread-wings.goose` | CLI, queries, MCP server |
 | `src/extract.goose` | the walk and per-language patterns (goose-treesitter) |
 | `src/graph.goose` | import and call linking, Louvain communities |
-| `src/update.goose` | `update`: the files that changed, and the calls a change reaches |
+| `src/update.goose` | `update`: the files that changed, and the calls a change reaches (`watch`, in `src/spread-wings.goose`, runs it on file events) |
 | `src/store.goose` | SQLite schema (goose-sqlite) |
-| `native/sw_sys.c` | `lstat` and `realpath`, which Goose's os module lacks |
+| `native/sw_sys.c` | what Goose's os module lacks: `lstat`, `realpath`, file sizes and times, file events for `watch` |
 | `tests/test.sh` | checks against `tests/fixtures/mini` |
 | `tests/graph_dump.py` | a graph without its row numbers, to compare two graphs of the same files |
 | `tests/random_changes.py` | random changes to a copy of a repo, `update` compared with `index` after each batch (not part of `test.sh`: run it on a real repo after changing `update` or a link rule) |

@@ -130,6 +130,29 @@ where one of several equally good files is taken, the choice is spelled
 out. `tests/graph_dump.py` prints a graph without row numbers, and the
 checks compare an updated graph with a fresh one after each kind of change.
 
+### Watch
+
+`watch` is `update` in a loop. It asks the system for file events on every
+folder of the walk (inotify, one watch a folder) and sleeps. An event wakes
+it; it waits until 200 ms pass with no further event (two seconds at
+most), adds watches for folders made since, and runs `update`. Each update
+that changed the graph is one line on standard output.
+
+The events only wake it. What changed is found by `update`, which looks at
+every file, so an event lost, or one for a file that does not matter, costs
+a look and no more. A look every 30 seconds (`--every`) covers anything
+missed. Without events (not Linux, or the limit on watches reached) it
+looks every two seconds.
+
+Each line carries what the change reaches: the files, not changed
+themselves, that import or call into a file that changed, was added or is
+gone, counted before the change and after, and the tests among them. That
+is where a precise tool has to look again.
+
+The watcher opens the graph for each update and closes it after, so a
+reader always finds the last finished state, and `compiler --into` can copy
+it at any time. It ends with the process that started it.
+
 `RULES_NUMBER` (`src/store.goose`) numbers what `index` writes for a repo.
 A graph written under another number is built whole: half of it under old
 rules and half under new would be neither.
@@ -367,6 +390,8 @@ key comes from the environment at run time (for example through
 - More languages (Java, Kotlin, C/C++, C#, PHP, Lua, Go).
 - A resolution setting for Louvain, and splitting test files apart from the
   code they test.
-- A watcher that runs `update` when files change and tells Swan what to
-  refresh; `compiler` answers kept through an update.
+- Swan reading the watcher's lines: its broad-map answers from a graph
+  that follows the files, and its own map pointed at what a change reaches.
+- `compiler` answers put again only where the graph or the map changed
+  (the copy is made whole today).
 - Links to Swan: from a Spread-Wings community to Swan's precise map.
