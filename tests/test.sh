@@ -177,6 +177,13 @@ cp "$work/dec2.db" "$work/oldver.db"
 q "$work/oldver.db" "delete from meta where key = 'schema'"
 check "schema: a graph from another version says to rebuild it" "import subprocess; r=subprocess.run(['$SW','callers','$work/oldver.db','ping'],capture_output=True,text=True); assert r.returncode != 0 and 'rebuild it' in r.stderr, r.stderr"
 
+# Goose, read by line (no tree-sitter grammar): definitions, imports, calls.
+"$SW" index tests/fixtures/goose "$work/goose.db" >/dev/null
+GQ() { echo "import sqlite3; c=sqlite3.connect('$work/goose.db')"; }
+check "goose: functions (nested and extern too), a struct and a top-level let, with their lines" "$(GQ); got=c.execute(\"select f.path,s.name,s.kind,s.row,s.end_row from symbols s join files f on f.id=s.file_id order by 1,4\").fetchall(); assert got == [('main.goose','UNIT','variable',6,6),('main.goose','Box','struct',8,8),('main.goose','main','function',10,19),('shapes.goose','c_helper','function',3,3),('shapes.goose','area','function',5,5),('shapes.goose','total_area','function',7,12),('shapes.goose','twice','function',8,10)], got"
+check "goose: comments, strings and raw strings hold no calls or definitions; methods and packages are not calls" "$(GQ); got=sorted(r[0] for r in c.execute(\"select callee from calls k join files f on f.id=k.file_id where f.path='main.goose'\")); assert got == ['print','str','total_area'], got"
+check "goose: import .shapes links main.goose to shapes.goose, and total_area resolves through it" "import json,subprocess; d=json.loads(subprocess.check_output(['$SW','neighbors','$work/goose.db','main.goose'])); assert d['imports'] == ['shapes.goose'], d; s=json.loads(subprocess.check_output(['$SW','callers','$work/goose.db','total_area']))['sites']; assert [(x['path'],x['line'],x['in'],x['defined_in']) for x in s] == [('main.goose',16,'main','shapes.goose')] and s[0]['resolution'] != 'by_name', s"
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

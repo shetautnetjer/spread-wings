@@ -9,7 +9,7 @@ what. Agents use it to get the shape of an unfamiliar codebase before they
 read any code. It is a take on [Graphify](https://github.com/Graphify-Labs/graphify),
 rebuilt to be fast, local and honest about what it knows.
 
-> **Status: 0.1.** Python, TypeScript/TSX, JavaScript and Rust. Links are
+> **Status: 0.1.** Python, TypeScript/TSX, JavaScript, Rust and Goose. Links are
 > matched by name or path, not resolved by a compiler, and every answer says
 > so. For exact answers (this call reaches that exact function), use
 > [Swan](https://github.com/shetautnetjer/Swan), its precise counterpart.
@@ -95,7 +95,11 @@ All output is JSON.
 
 ## Known limits (0.1)
 
-- Four languages. Goose-treesitter parses more (Java, Kotlin, C/C++, C#,
+- Goose is read by line, not from a syntax tree (goose-treesitter has no
+  Goose grammar): definitions, `import .x;` and bare calls. A call into a
+  file the caller does not import itself is matched by name, though Goose
+  programs share one namespace across their imports.
+- Five languages. Goose-treesitter parses more (Java, Kotlin, C/C++, C#,
   PHP, Lua, GDScript, shaders); their patterns come next.
 - Patterns match fixed shapes, so unusual definitions can be missed (for
   example a Python function inside a decorator factory's return).
