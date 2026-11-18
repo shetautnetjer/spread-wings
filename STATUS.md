@@ -150,3 +150,36 @@ Limits:
   dependency outside them is not counted a member.
 - Nothing uses it yet: Swan reading it in place of its own guesses is the
   next step there.
+
+## 2026-11-18: `compiler` takes Swan's answer for every call site
+
+`compiler` put only the calls tied by name to Swan. Most of what was still
+wrong after the definitions change was tied another way (rea: 21,389 wrong
+`imported_file` links), and calls no rule could tie had answers waiting.
+
+- Every call site the map covers now gets Swan's answer: one repo
+  definition becomes its only link (`compiler`), whatever rule had tied it
+  and to however many candidates; outside the repo, no link
+  (`compiler_outside`); a value the graph does not hold as a definition (a
+  parameter, a variable), no link into other files than the one Swan names
+  (`compiler_value`). Sites the map does not cover, or covers unclearly,
+  stay as the rules left them.
+- It says what it did: tied (as they were, narrowed from several,
+  corrected, new), outside, values, left.
+- After it, of the links Swan can judge: rea TypeScript 99.8% right (88.4%
+  before), relate Rust 99.6% (91.3%), Understand-Anything 100% (84.7%),
+  Python 99.3 to 100%. rea: 8,422 calls narrowed from several candidates
+  to one, 2,669 corrected, 2,315 linked that no rule could tie.
+- Time: rea 3.4 s for 739,448 call sites (1.2 s before, for the 10,496 tied by name); relate
+  1.1 s.
+- Tests: 8 checks on the kinds fixture with a hand-made map (a same-file
+  link corrected, a shared call narrowed, an untied call linked, an
+  outside call unlinked, a value call unlinked, an uncovered site left);
+  the step from before leaves all of them as the rules had them. 102 pass
+  in the microVM.
+
+Limits:
+- A site is a line and a name: two calls of one name on a line with
+  different answers are left alone, as before.
+- The graph is as good as the map is fresh: files changed since the map
+  was built are skipped and counted.

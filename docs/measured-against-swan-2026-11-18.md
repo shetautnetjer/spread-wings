@@ -215,3 +215,32 @@ of each call, 13 s of a 29 s link step on rea).
   and no reader here yet; Go has no grammar. `score` already lists what
   Swan has for them (rea: 204 C++ functions, 62 Java methods; relate: 257
   Go functions, 345 Java methods), all at 0.
+
+# Third pass, same day: the compiler's answer for every call site
+
+`compiler` put only the calls tied by name to Swan. The second pass showed
+that most of what was still wrong was tied some other way (`imported_file`
+on TypeScript), and that calls no rule could tie had answers waiting. It
+now takes Swan's answer for every call site the map covers: one repo
+definition becomes the site's only link; outside the repo, no link; a
+value the graph does not hold as a definition, no link into other files
+than the one Swan names.
+
+| Repo | Call sites | Swan covers | Tied to one definition | of them: as they were / narrowed from several / corrected / new | Outside (guessed links removed) | Values | Left unclear | Time |
+|---|---|---|---|---|---|---|---|---|
+| rea | 739,448 | 264,739 | 181,860 | 167,563 / 8,422 / 2,669 / 2,315 | 80,282 (2,096) | 2,156 | 441 | 3.4 s |
+| relate | 180,610 | 154,695 | 63,830 | 51,921 / 5,477 / 1,050 / 5,077 | 85,205 (8,604) | 4,839 | 821 | 1.1 s |
+| Understand-Anything | 28,096 | 7,111 | 3,494 | 3,397 / 61 / 6 / 0 | 3,592 (0) | 14 | 11 | 0.07 s |
+| Agent-Reach | 6,963 | 5,347 | 2,788 | 2,647 / 64 / 16 / 43 | 2,522 (108) | 14 | 23 | 0.03 s |
+
+Links right, of those Swan judges, after `compiler` (before this change in
+brackets): rea TypeScript 181,806 of 182,253, 99.8% (88.4%); relate Rust
+60,880 of 61,116, 99.6% (91.3%); Understand-Anything TypeScript 3,210 of
+3,210 (84.7%); relate Python 2,829 of 2,829 (99.2%); Agent-Reach Python
+2,793 of 2,812, 99.3% (92.7%). These are the map's own answers put into the
+graph, so they say how much of the graph the map now speaks for, not how
+good the rules are: the rules' own numbers are the second pass's.
+
+What stays a guess: every call site Swan's map does not cover (rea: 474,709
+of 739,448, mostly calls into libraries, which have no link anyway, and
+files of languages Swan did not index), and the 441 it covers unclearly.
