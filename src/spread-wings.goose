@@ -54,7 +54,7 @@ spread-wings 0.1.0: a broad code graph from syntax alone
   spread-wings callers <graph.db> <name>
   spread-wings touches <graph.db> <name> [path]   what changing it reaches: files, tests, groups
   spread-wings serve <graph.db>
-  spread-wings compiler <graph.db> <swan.db>   compiler answers from a Swan map for calls still by_name
+  spread-wings compiler <graph.db> <swan.db>   compiler answers from a Swan map, for every call site it covers
   spread-wings survey <repo>                   the projects a repo holds: where, which package manager, which versions each wants
   spread-wings score <graph.db> <swan.db>      what the graph's definitions and links are worth against a Swan map
   spread-wings decide <graph.db> [--max N] [--workers N]   Span-02 decisions for calls still by_name

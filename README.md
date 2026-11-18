@@ -107,7 +107,7 @@ bin/spread-wings callers myrepo.db parse_config
 bin/spread-wings touches myrepo.db parse_config   # before an edit: the files, tests and groups it reaches
 bin/spread-wings survey ~/code/myrepo             # the projects it holds: where, which package manager, which versions each wants
 bin/spread-wings serve myrepo.db      # the same four tools over MCP (stdio)
-bin/spread-wings compiler myrepo.db ~/.local/share/swan/maps/myrepo/swan.db   # optional: compiler answers from a Swan map
+bin/spread-wings compiler myrepo.db ~/.local/share/swan/maps/myrepo/swan.db   # optional: Swan's answer for every call site its map covers
 bin/spread-wings score myrepo.db ~/.local/share/swan/maps/myrepo/swan.db      # what the definitions and links are worth, per language and rule, against that map
 OPENROUTER_API_KEY=... bin/spread-wings decide myrepo.db   # optional: Span-02 decisions for calls still by_name
 ```
@@ -136,8 +136,9 @@ All output is JSON.
   imports, then anywhere: each candidate gets a link and a share of the
   weight. Against Swan (2026-11-18) the right one is among them for 88% of
   such TypeScript calls through an imported file and 72% of such Rust calls
-  by name; `compiler` settles the by-name ones from a Swan map, `decide`
-  with a model.
+  by name. `compiler` settles every call site a Swan map covers, whatever
+  rule tied it (afterwards 99.6 to 100% of the links Swan can judge are
+  right on the four test repos); `decide` asks a model about the rest.
 - TypeScript: keys of an object literal that hold a function, namespaces
   and JSX element use (`<Panel />`) are not read.
 

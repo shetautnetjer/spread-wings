@@ -260,6 +260,35 @@ check "score: nothing is written to the graph" "import subprocess; a=subprocess.
 check "score: a Swan map whose symbols carry no kind is refused, saying to rebuild it" "import subprocess; r=subprocess.run(['$SW','score','$work/c.db','$work/swan.db'],capture_output=True,text=True); assert r.returncode != 0 and 'no kind and language' in r.stderr, r.stderr"
 check "score: a Swan map of another folder is an error" "import subprocess; r=subprocess.run(['$SW','score','$work/kinds.db','$work/swan_other.db'],capture_output=True,text=True); assert r.returncode != 0 and 'map the same folder' in r.stderr, r.stderr"
 
+# compiler, on every call site (2026-11-18): Swan's answer replaces a link
+# any rule made, adds the link no rule could, and removes a link to a
+# namesake when the call is of a value. The fixture's map plus two answers:
+# list.steps() is the function steps, and helper() in lib.rs is a value
+# defined in store.rs.
+cp "$work/kinds.db" "$work/kindsc.db"
+cp "$work/swan_kinds.db" "$work/swan_fix.db"
+python3 - "$work/swan_fix.db" <<'PY'
+import sqlite3, sys
+d = sqlite3.connect(sys.argv[1])
+d.executescript("""
+INSERT INTO symbols VALUES (12, 'steps', 'function', 'typescript', 'web/shapes.ts', 8, 1),
+    (13, 'helper', 'variable', 'rust', 'core/src/store.rs', 0, 1);
+INSERT INTO occurrences VALUES (12, 'web/use.ts', 7, 0, 0, 0), (13, 'core/src/lib.rs', 29, 0, 0, 0);
+""")
+d.commit()
+PY
+linkedc() { q "$work/kindsc.db" "select coalesce((select group_concat(e.resolution || '>' || s.name || '@' || s.row || coalesce('/' || s.container, ''), ' ') from call_edges e join symbols s on s.id = e.callee where e.file_id = c.file_id and e.row = c.row and s.name = c.callee), coalesce(c.note, 'unlinked')) from calls c join files f on f.id = c.file_id where f.path = '$1' and c.row = $2 and c.callee = '$3'"; }
+"$SW" compiler "$work/kindsc.db" "$work/swan_fix.db" > "$work/said.txt"
+eq "compiler: a link the same-file rule made to the wrong type's method is corrected (s.flush() is Store's, in store.rs)" "$(linked core/src/lib.rs 41 flush) -> $(linkedc core/src/lib.rs 41 flush)" "same_file>flush@10/Sink -> compiler>flush@4/Store"
+eq "compiler: a call shared between two candidates keeps the one the compiler names" "$(linked web/shapes.ts 53 close) -> $(linkedc web/shapes.ts 53 close)" "same_file>close@27/Port same_file>close@36/Session -> compiler>close@27/Port"
+eq "compiler: a call no rule could tie gets the compiler's link" "$(linked web/use.ts 8 steps) -> $(linkedc web/use.ts 8 steps)" "unlinked -> compiler>steps@9"
+eq "compiler: a call the compiler resolves outside the repo keeps no guessed link" "$(linked web/shapes.ts 54 push) -> $(linkedc web/shapes.ts 54 push)" "same_file>push@40/Session -> compiler_outside"
+eq "compiler: a call of a value defined in another file loses its link to the namesake function" "$(linked core/src/lib.rs 30 helper) -> $(linkedc core/src/lib.rs 30 helper)" "same_file>helper@26 -> compiler_value"
+eq "compiler: a site the map says nothing about is left as the rules had it" "$(linkedc web/use.ts 9 steps) $(linkedc web/shapes.ts 57 create)" "imported_file>steps@9 type_name>create@42/Session"
+check "compiler: it says what it did: tied (as they were, narrowed, corrected, new), outside, values" "s=open('$work/said.txt').read(); assert 'covers 9: 7 tied to one definition, 1 outside the repo, 1 calls of a value the graph does not hold, 0 left (unclear)' in s, s; assert 'Of those tied: 4 as they were, 1 narrowed from several, 1 corrected, 1 new. Guessed links removed at 1 outside sites and 1 value sites' in s, s"
+"$SW" score "$work/kindsc.db" "$work/swan_fix.db" > "$work/scorec.json"
+check "compiler: afterwards every link the map can judge is right" "import json; d=json.load(open('$work/scorec.json')); j=sum(r['judged'] for r in d['links']); assert j == 7 and j == sum(r['right'] for r in d['links']), d['links']"
+
 # survey: the projects a repo holds, read from manifest, lock and version
 # files (tests/fixtures/survey: a pnpm workspace with a bun package and one
 # outside the workspace, two Python projects, a cargo workspace with an
