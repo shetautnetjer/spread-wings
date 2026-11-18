@@ -113,3 +113,40 @@ Limits:
   namespaces and JSX element use are not read.
 - Java, Kotlin, C, C++, C#, PHP, Lua: no reader yet (`score` shows them at
   0 beside what Swan has).
+
+## 2026-11-18: `survey`, the projects a repo holds
+
+Agreed with the owner the same day (Swan's docs/wings-and-swan.md): what
+can be learned by only reading files belongs here. First piece: a repo is
+rarely one project at its top, and Swan's bugs of the week were each that
+assumption (a nested cargo crate with no rows, a package with its own
+tsconfig losing its imports, Go below the top run from the top).
+
+- `spread-wings survey <repo>` (src/survey.goose): one entry per project,
+  in path order. node (`package.json`), python (`pyproject.toml`,
+  `setup.py`, `setup.cfg`, `requirements.txt`), rust (`Cargo.toml`), go
+  (`go.mod`), java (Maven, Gradle), deno. For each: name, package manager
+  and the file that says so (`packageManager`, else the lock file here or
+  above), the versions it wants (`.nvmrc`, `.node-version`, volta,
+  `.python-version`, `.bun-version`, `rust-toolchain[.toml]`, `go.mod`,
+  `mise.toml`, `.tool-versions`) with ranges kept beside pins
+  (`node.requires` from engines, `python.requires`, `rust.requires`), the
+  workspace above it and whether that workspace lists it, whether
+  `node_modules` or a virtualenv is there, the test script, TypeScript
+  version and tsconfig files.
+- A value set in a folder holds for the folders below until one says
+  otherwise.
+- It only reads: no package manager, interpreter or build file runs.
+- On the four test repos: Understand-Anything 9 node projects under two
+  pnpm workspaces (3 ms); relate 45 cargo, 7 node, 3 go, 2 java, 1 python
+  (6 ms); rea 5 node, 2 python (11 ms); Agent-Reach 1 python (2 ms).
+- Tests: tests/fixtures/survey and 13 checks; 94 pass in the microVM.
+
+Limits:
+- It does not check that a wanted version is installed on this machine.
+- It does not read .gitignore: only the folders every walk skips
+  (node_modules, target, dist, build, hidden ones) are left out.
+- Workspace membership is by the workspace's own globs; a cargo path
+  dependency outside them is not counted a member.
+- Nothing uses it yet: Swan reading it in place of its own guesses is the
+  next step there.

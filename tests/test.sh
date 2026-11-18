@@ -260,6 +260,31 @@ check "score: nothing is written to the graph" "import subprocess; a=subprocess.
 check "score: a Swan map whose symbols carry no kind is refused, saying to rebuild it" "import subprocess; r=subprocess.run(['$SW','score','$work/c.db','$work/swan.db'],capture_output=True,text=True); assert r.returncode != 0 and 'no kind and language' in r.stderr, r.stderr"
 check "score: a Swan map of another folder is an error" "import subprocess; r=subprocess.run(['$SW','score','$work/kinds.db','$work/swan_other.db'],capture_output=True,text=True); assert r.returncode != 0 and 'map the same folder' in r.stderr, r.stderr"
 
+# survey: the projects a repo holds, read from manifest, lock and version
+# files (tests/fixtures/survey: a pnpm workspace with a bun package and one
+# outside the workspace, two Python projects, a cargo workspace with an
+# excluded crate and a fuzz crate, a Go module, a Maven project, and a
+# package.json under dist/ that is build output).
+cp -r tests/fixtures/survey "$work/survey"
+before=$(cd "$work/survey" && find . | sort | sha256sum)
+"$SW" survey "$work/survey" > "$work/survey.json"
+SV() { echo "import json; d=json.load(open('$work/survey.json')); P={(p['path'], p['kind']): p for p in d['projects']}; W=lambda p: {k: (v['version'], v['from']) for k, v in p['wants'].items()}"; }
+check "survey: twelve projects of five kinds, in path order, nothing from dist/" "$(SV); assert d['count'] == {'node': 4, 'python': 2, 'rust': 4, 'go': 1, 'java': 1, 'deno': 0}, d['count']; assert [p['path'] for p in d['projects']] == ['.', 'core', 'core/crates/engine', 'core/crates/skip', 'core/fuzz', 'extras/old', 'go/svc', 'java/app', 'packages/tools', 'packages/web', 'services/api', 'services/legacy']"
+check "survey: the root is a pnpm workspace; .nvmrc beside mise.toml wins for Node; the version drops its checksum" "$(SV); p=P[('.', 'node')]; assert p['package_manager'] == {'name': 'pnpm', 'from': 'package.json packageManager'}, p; assert W(p) == {'node': ('22.3.0', '.nvmrc'), 'pnpm': ('9.1.0', 'package.json packageManager')}, W(p); assert p['workspace'] == {'root': '.', 'from': 'package.json workspaces', 'is_root': True}, p"
+check "survey: a member package takes the workspace's manager and Node, and keeps its own engines range beside the pinned version" "$(SV); p=P[('packages/web', 'node')]; assert p['name'] == '@fixture/web' and p['package_manager']['name'] == 'pnpm'; assert W(p)['node'] == ('22.3.0', '.nvmrc') and W(p)['node.requires'] == ('>=22', 'packages/web/package.json engines'), W(p); assert p['workspace']['member'] is True and p['workspace']['root'] == '.'; assert (p['test_script'], p['typescript'], p['tsconfigs']) == ('vitest run', '^5.4.0', ['tsconfig.app.json', 'tsconfig.json']), p"
+check "survey: a package with its own lock file uses that manager (bun), and its .bun-version" "$(SV); p=P[('packages/tools', 'node')]; assert p['package_manager'] == {'name': 'bun', 'from': 'packages/tools/bun.lock'}, p; assert W(p)['bun'] == ('1.2.3', 'packages/tools/.bun-version')"
+check "survey: a package the workspace does not list is not a member; volta pins its Node" "$(SV); p=P[('extras/old', 'node')]; assert p['workspace']['member'] is False and W(p)['node'] == ('18.20.0', 'extras/old/package.json volta'), p"
+check "survey: node_modules is not there, and is said to be" "$(SV); assert all(p['dependencies_installed'] == {'installed': False} for p in d['projects'] if p['kind'] == 'node')"
+check "survey: a uv project: its pinned Python beside requires-python, its virtualenv and that one's Python, pytest" "$(SV); p=P[('services/api', 'python')]; assert (p['name'], p['manifest'], p['package_manager']['name']) == ('api', 'pyproject.toml', 'uv'), p; assert W(p) == {'python': ('3.12.4', 'services/api/.python-version'), 'python.requires': ('>=3.11', 'services/api/pyproject.toml requires-python')}, W(p); assert p['environment'] == {'venv': 'services/api/.venv', 'python': '3.12.4'} and p['tests'] == 'pytest', p"
+check "survey: a setup.py project: pip from requirements.txt, Python from the mise.toml at the top, no virtualenv" "$(SV); p=P[('services/legacy', 'python')]; assert (p['manifest'], p['package_manager']['name'], p['environment']) == ('setup.py', 'pip', None), p; assert W(p) == {'python': ('3.12', 'mise.toml')}, W(p)"
+check "survey: a cargo workspace: its member, the crate it excludes, and a fuzz crate that is a workspace of its own; the pinned toolchain reaches all of them" "$(SV); e=P[('core/crates/engine', 'rust')]; assert P[('core', 'rust')]['workspace']['is_root'] is True; assert e['name'] == 'engine' and e['workspace'] == {'root': 'core', 'from': 'core/Cargo.toml workspace', 'is_root': False, 'member': True}, e; assert W(e) == {'rust': ('1.88.0', 'core/rust-toolchain.toml'), 'rust.requires': ('>=1.75', 'core/crates/engine/Cargo.toml rust-version')}, W(e); assert P[('core/crates/skip', 'rust')]['workspace']['member'] is False; assert P[('core/fuzz', 'rust')]['workspace'] == {'root': 'core/fuzz', 'from': 'core/fuzz/Cargo.toml workspace', 'is_root': True}"
+check "survey: a Go module below the top: its module path, Go version and toolchain; a Maven project" "$(SV); g=P[('go/svc', 'go')]; assert g['name'] == 'example.com/svc' and W(g) == {'go': ('1.22', 'go/svc/go.mod'), 'go.toolchain': ('1.22.3', 'go/svc/go.mod toolchain')}, g; assert P[('java/app', 'java')]['build_tool'] == 'maven'"
+eq "survey: it only reads: the repo is as it was" "$(cd "$work/survey" && find . | sort | sha256sum)" "$before"
+mkdir "$work/survey/node_modules"
+"$SW" survey "$work/survey" > "$work/survey.json"
+check "survey: with node_modules at the workspace root, its packages' dependencies are installed there" "$(SV); assert P[('packages/web', 'node')]['dependencies_installed'] == {'installed': True, 'at': 'node_modules'}, P[('packages/web', 'node')]"
+check "survey: says nothing was run, and a path that is no folder is an error" "$(SV); import subprocess; assert 'nothing of the repo was run' in d['evidence']; r=subprocess.run(['$SW','survey','$work/survey/package.json'],capture_output=True,text=True); assert r.returncode != 0"
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

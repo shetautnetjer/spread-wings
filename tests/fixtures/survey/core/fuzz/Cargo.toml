@@ -1,0 +1,5 @@
+[package]
+name = "engine-fuzz"
+version = "0.0.0"
+
+[workspace]

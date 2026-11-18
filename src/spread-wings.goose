@@ -22,6 +22,7 @@ import .graph;
 import .decide;
 import .compiler;
 import .score;
+import .survey;
 
 let VERSION = "0.1.0";
 
@@ -54,6 +55,7 @@ spread-wings 0.1.0: a broad code graph from syntax alone
   spread-wings touches <graph.db> <name> [path]   what changing it reaches: files, tests, groups
   spread-wings serve <graph.db>
   spread-wings compiler <graph.db> <swan.db>   compiler answers from a Swan map for calls still by_name
+  spread-wings survey <repo>                   the projects a repo holds: where, which package manager, which versions each wants
   spread-wings score <graph.db> <swan.db>      what the graph's definitions and links are worth against a Swan map
   spread-wings decide <graph.db> [--max N] [--workers N]   Span-02 decisions for calls still by_name
                                             (OPENROUTER_API_KEY in the environment; default 5000 questions, 32 parallel requests)
@@ -518,6 +520,10 @@ fn main() {
     }
     if cmd == "decide-apply" && a.len == 3 {
         decide_apply_main(a[2]);
+        return;
+    }
+    if cmd == "survey" && a.len == 3 {
+        survey_main(a[2]);
         return;
     }
     if cmd == "score" && a.len == 4 {

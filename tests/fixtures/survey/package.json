@@ -1,0 +1,7 @@
+{
+  "name": "survey-fixture",
+  "private": true,
+  "packageManager": "pnpm@9.1.0+sha512.abc",
+  "workspaces": ["packages/*"],
+  "scripts": { "test": "pnpm -r test" }
+}
