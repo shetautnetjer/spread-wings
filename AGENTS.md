@@ -13,6 +13,7 @@ is ever run). Read [docs/DESIGN.md](docs/DESIGN.md) first.
 | `native/sw_sys.c` | `lstat` and `realpath`, which Goose's os module lacks |
 | `tests/test.sh` | checks against `tests/fixtures/mini` |
 | `tests/graph_dump.py` | a graph without its row numbers, to compare two graphs of the same files |
+| `tests/random_changes.py` | random changes to a copy of a repo, `update` compared with `index` after each batch (not part of `test.sh`: run it on a real repo after changing `update` or a link rule) |
 
 Rules:
 

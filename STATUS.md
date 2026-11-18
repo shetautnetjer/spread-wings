@@ -253,9 +253,10 @@ Checked:
   (edits, appended and renamed functions, imports dropped and borrowed,
   files copied, moved, swapped, deleted, folders moved, `__init__.py`
   added and removed, new top-level folders), the updated graph compared
-  with a fresh one after every batch. On the final build: Agent-Reach 100
-  rounds, Understand-Anything 100, this repo (Goose) 60, relate 20, rea 8;
-  1,001 rounds over the day's builds. None differed.
+  with a fresh one after every batch (tests/random_changes.py). On the
+  final build: Agent-Reach 100 rounds, Understand-Anything 100, this repo
+  (Goose) 60, relate 20, rea 8; 1,001 rounds over the day's builds. None
+  differed.
 
 Found by measuring, and fixed before this entry:
 - An import read through the index on the column being written came round
