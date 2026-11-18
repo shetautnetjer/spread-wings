@@ -53,14 +53,22 @@ rebuilt to be fast, local and honest about what it knows.
 
 - **Files, definitions, imports and call sites**, from
   [goose-treesitter](https://github.com/shetautnetjer/goose-treesitter)
-  patterns run on every core.
+  parses on every core. TypeScript, TSX, JavaScript and Rust definitions
+  are read from the syntax tree by the kind of each node (a method, a
+  constant holding a function, a `pub(crate) const fn` are definitions
+  however they are spelled); Python's, and every language's imports and
+  calls, by pattern.
 - **Links**: imports resolved to files (relative TS/JS paths, Python modules,
   Rust `mod`, `crate::`, `self::`, `super::` and workspace crates), and each
   call tied to a definition by the strongest evidence the code gives, first
-  match wins: **same_file**; **imported_name** (the caller's file imports
+  match wins: **own_type** (`this.f()`, `self.f()`: the f of the calling
+  method's own type); **type_name** (`Type::f()`, `Type.f()`: the f of the
+  type named); **same_file**; **imported_name** (the caller's file imports
   that name from a file defining it); **imported_file** (it imports a file
   defining it); else **by_name** (any definition with that name, for names
-  defined in at most 8 places). Every link stores which rule decided it.
+  defined in at most 8 places). A bare call never reaches a method, a call
+  on an object never a plain function, and no call a definition in another
+  language. Every link stores which rule decided it.
 - **Communities**: groups of code files that import and call each other,
   found with Louvain clustering (deterministic, resolution 1.5 by default,
   `--resolution N` to change). Test files don't form groups of their own:
@@ -82,6 +90,7 @@ bin/spread-wings callers myrepo.db parse_config
 bin/spread-wings touches myrepo.db parse_config   # before an edit: the files, tests and groups it reaches
 bin/spread-wings serve myrepo.db      # the same four tools over MCP (stdio)
 bin/spread-wings compiler myrepo.db ~/.local/share/swan/maps/myrepo/swan.db   # optional: compiler answers from a Swan map
+bin/spread-wings score myrepo.db ~/.local/share/swan/maps/myrepo/swan.db      # what the definitions and links are worth, per language and rule, against that map
 OPENROUTER_API_KEY=... bin/spread-wings decide myrepo.db   # optional: Span-02 decisions for calls still by_name
 ```
 
@@ -101,10 +110,18 @@ All output is JSON.
   programs share one namespace across their imports.
 - Five languages. Goose-treesitter parses more (Java, Kotlin, C/C++, C#,
   PHP, Lua, GDScript, shaders); their patterns come next.
-- Patterns match fixed shapes, so unusual definitions can be missed (for
-  example a Python function inside a decorator factory's return).
-- Without `decide`, method calls on objects whose type the imports don't
-  reveal stay `by_name`.
+- Python definitions, and all imports and calls, are matched as fixed
+  shapes, so unusual ones can be missed (for example a Python function
+  inside a decorator factory's return).
+- A call on an object whose type the code does not name (`x.f()`) is tied
+  to the methods called f in the caller's file, then in the files it
+  imports, then anywhere: each candidate gets a link and a share of the
+  weight. Against Swan (2026-11-18) the right one is among them for 88% of
+  such TypeScript calls through an imported file and 72% of such Rust calls
+  by name; `compiler` settles the by-name ones from a Swan map, `decide`
+  with a model.
+- TypeScript: keys of an object literal that hold a function, namespaces
+  and JSX element use (`<Panel />`) are not read.
 
 ## Documents
 

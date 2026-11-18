@@ -281,6 +281,9 @@ fn link_imports(db: i64) -> i64 {
 
 // Each call site is tied to the definitions its name could mean, by the
 // strongest evidence the code gives, first match wins:
+//   own_type       `this.f()` / `self.f()` / `Self::f()`: the f of the type
+//                  the calling method belongs to;
+//   type_name      `Type::f()` / `Type.f()`: the f of the type named;
 //   same_file      a definition with that name in the caller's own file;
 //   imported_name  the caller's file imports that name from a file that
 //                  defines it (`from m import f`, `import { f }`, `use m::F`);
@@ -294,10 +297,14 @@ fn link_calls(db: i64) {
         CREATE TEMP TABLE defs AS
             SELECT s.id AS sid, s.file_id AS sfile, s.name AS name FROM symbols s
             WHERE s.kind IN ('function', 'class', 'struct', 'enum', 'trait', 'interface');
-        CREATE INDEX defs_name ON defs(name);
+        -- One index, by name and then file: with a second one on the name
+        -- alone, SQLite took that for "the definitions of this name in that
+        -- imported file" and read every definition of the name for each
+        -- import of each call (13 s of morluto/rea's 29 s link step once a
+        -- common method name had 600 definitions).
+        CREATE INDEX defs_name_file ON defs(name, sfile);
         CREATE TEMP TABLE ndefs AS SELECT name, COUNT(*) AS n FROM defs GROUP BY name;
         CREATE INDEX ndefs_name ON ndefs(name);
-        CREATE INDEX defs_name_file ON defs(name, sfile);
         -- Candidate definitions per call site. A name defined in at most 50
         -- places: all of them. A commoner name (`_write`, `main`, `run`): only
         -- the definitions in the caller's own file and in files it imports,
@@ -320,6 +327,27 @@ fn link_calls(db: i64) {
             CROSS JOIN defs d ON d.name = c.callee AND d.sfile = i.dst
             WHERE k.n > 50;
         CREATE INDEX cands_cid ON cands(cid);
+        -- A call reaches a definition of its own language: a TypeScript
+        -- `open()` is not the Rust `fn open` of the same repo. TypeScript,
+        -- TSX and JavaScript are one language here.
+        DELETE FROM cands WHERE
+            (SELECT CASE WHEN lang IN ('typescript', 'tsx', 'javascript') THEN 'js' ELSE lang END FROM files WHERE id = cfile)
+            <> (SELECT CASE WHEN lang IN ('typescript', 'tsx', 'javascript') THEN 'js' ELSE lang END FROM files WHERE id = sfile);
+        -- A call on an object (`x.f()`) is not a call of a plain function, in
+        -- the languages where a module's function is not reached with a dot:
+        -- Rust (`m::f()`), and TypeScript and JavaScript unless the name
+        -- before the dot is imported from the function's file (`import * as
+        -- m`, `import m from`). (Against Swan, same day: morluto/rea 19,901
+        -- such TypeScript links, 471 right; relate 9,381 Rust links, 14 right.)
+        DELETE FROM cands WHERE sid IN (SELECT id FROM symbols WHERE COALESCE(container, '') = '')
+          AND cid IN (SELECT k.rowid FROM calls k JOIN files f ON f.id = k.file_id
+                      WHERE f.lang IN ('typescript', 'tsx', 'javascript', 'rust')
+                        AND length(COALESCE(k.text, '')) > length(k.callee) + 1
+                        AND substr(k.text, -(length(k.callee) + 1)) = '.' || k.callee)
+          AND NOT EXISTS (SELECT 1 FROM calls k JOIN imports i ON i.file_id = k.file_id AND i.dst = cands.sfile
+                          WHERE k.rowid = cands.cid
+                            AND instr(',' || REPLACE(COALESCE(i.names, ''), '@', '') || ',',
+                                      ',' || substr(k.text, 1, instr(k.text, '.') - 1) || ',') > 0);
         -- A method call on a local object is not a call to a module-level
         -- function of that name: `seen.add(x)` where `seen = set()`, or
         -- `G.add_edge(...)` on a parameter G, beside `def add(...)` in the
@@ -355,6 +383,55 @@ fn link_calls(db: i64) {
                OR EXISTS (SELECT 1 FROM symbols s WHERE s.id = calls.in_symbol
                           AND instr(COALESCE(s.params, ''), ',' || calls.callee || ',') > 0));
         INSERT OR IGNORE INTO done SELECT rowid FROM calls WHERE note = 'local_value';
+
+        -- A bare call (`f(x)`) is not a call of a method: a method is reached
+        -- through an object or a type. (Against Swan on relatedb/relate,
+        -- 2026-11-18: 2,309 Rust links from a bare call to a method, 150
+        -- right, most of those to a function nested in a method, which is
+        -- no method.)
+        -- (After the rule above: a parameter called bare is noted as the
+        -- value it is, whatever else has its name.)
+        DELETE FROM cands WHERE sid IN (SELECT id FROM symbols WHERE COALESCE(container, '') <> '')
+          AND cid IN (SELECT k.rowid FROM calls k
+                      WHERE instr(COALESCE(k.text, k.callee), '.') = 0 AND instr(COALESCE(k.text, k.callee), '::') = 0);
+
+        -- The type the call itself names. `this.f()`, `self.f()` and
+        -- `Self::f()` are the f of the type the calling method belongs to;
+        -- `Pair::new()` and `Session.create()` the f of that type (a name
+        -- with a capital and a small letter: `LOGGER.info()` is a call on a
+        -- value). The definitions of the caller's own file first, then any.
+        -- (Against Swan, 2026-11-18, links whose type matched: relatedb/relate
+        -- Rust 8,405 of 8,480 right; morluto/rea TypeScript 1,642 of 1,669.)
+        INSERT INTO chosen
+            SELECT c.cid, c.sid, 'own_type' FROM cands c JOIN calls k ON k.rowid = c.cid
+            JOIN symbols me ON me.id = k.in_symbol JOIN symbols d ON d.id = c.sid
+            WHERE c.cid NOT IN (SELECT cid FROM done) AND k.qual IN ('this', 'self', 'Self')
+              AND COALESCE(me.container, '') <> '' AND d.container = me.container AND c.sfile = c.cfile;
+        INSERT OR IGNORE INTO done SELECT cid FROM chosen;
+        INSERT INTO chosen
+            SELECT c.cid, c.sid, 'own_type' FROM cands c JOIN calls k ON k.rowid = c.cid
+            JOIN symbols me ON me.id = k.in_symbol JOIN symbols d ON d.id = c.sid
+            WHERE c.cid NOT IN (SELECT cid FROM done) AND k.qual IN ('this', 'self', 'Self')
+              AND COALESCE(me.container, '') <> '' AND d.container = me.container;
+        INSERT OR IGNORE INTO done SELECT cid FROM chosen;
+        INSERT INTO chosen
+            SELECT c.cid, c.sid, 'type_name' FROM cands c JOIN calls k ON k.rowid = c.cid JOIN symbols d ON d.id = c.sid
+            WHERE c.cid NOT IN (SELECT cid FROM done) AND k.qual GLOB '[A-Z]*[a-z]*' AND k.qual <> 'Self'
+              AND d.container = k.qual AND c.sfile = c.cfile;
+        INSERT OR IGNORE INTO done SELECT cid FROM chosen;
+        INSERT INTO chosen
+            SELECT c.cid, c.sid, 'type_name' FROM cands c JOIN calls k ON k.rowid = c.cid JOIN symbols d ON d.id = c.sid
+            WHERE c.cid NOT IN (SELECT cid FROM done) AND k.qual GLOB '[A-Z]*[a-z]*' AND k.qual <> 'Self'
+              AND d.container = k.qual;
+        INSERT OR IGNORE INTO done SELECT cid FROM chosen;
+        -- A type is named and none of the candidates is that type's: f
+        -- belongs to a type this repo does not define (`Vec::new()`,
+        -- `Promise.all()`) or comes to it from a trait or a parent, and the
+        -- methods of other types are not what is called. (relate: 5,211 such
+        -- Rust links, 248 right; rea: 1,277 TypeScript links, 3 right.)
+        DELETE FROM cands WHERE cid NOT IN (SELECT cid FROM done)
+          AND cid IN (SELECT k.rowid FROM calls k WHERE k.qual GLOB '[A-Z]*[a-z]*' AND k.qual <> 'Self')
+          AND sid IN (SELECT id FROM symbols WHERE COALESCE(container, '') <> '');
 
         INSERT INTO chosen SELECT cid, sid, 'same_file' FROM cands WHERE sfile = cfile AND cid NOT IN (SELECT cid FROM done);
         INSERT OR IGNORE INTO done SELECT cid FROM chosen;
@@ -661,9 +738,14 @@ fn link_calls(db: i64) {
                           AND instr(COALESCE(s.params, ''), ',' || calls.callee || ',') > 0));
         INSERT OR IGNORE INTO done SELECT rowid FROM calls WHERE note = 'local_value';
 
+        -- Not for `self.f()` / `this.f()`: when the caller's own type has no
+        -- f here and no imported file does, f comes from a parent or a
+        -- trait outside the repo, not from whatever else is called f.
+        -- (relate: 911 such Rust links, none right.)
         INSERT INTO chosen
             SELECT c.cid, c.sid, 'by_name' FROM cands c
-            WHERE c.cid NOT IN (SELECT cid FROM done) AND c.n <= 8;
+            WHERE c.cid NOT IN (SELECT cid FROM done) AND c.n <= 8
+              AND c.cid NOT IN (SELECT k.rowid FROM calls k WHERE k.qual IN ('this', 'self', 'Self'));
 
         INSERT INTO call_edges (caller, callee, file_id, row, weight, by_name, resolution)
             SELECT c.in_symbol, ch.sid, c.file_id, c.row,

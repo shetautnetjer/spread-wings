@@ -36,7 +36,10 @@ fn swan_meta(db: i64, key: const u8[:], out: u8[>..]&) -> bool {
     return found;
 }
 
-fn compiler_main(db_path: const u8[:], swan_db: const u8[:]) {
+// Opens the graph with the Swan map attached as `sw`, after checking that
+// the map is of this code: its root is the graph's root (filled into
+// `root`). Returns the database and when the map's SCIP run was (ns).
+fn attach_swan(db_path: const u8[:], swan_db: const u8[:], root: u8[>..]&) -> i64, i64 {
     guard find(swan_db, "'") < 0 else { abort("spread-wings: the Swan map path cannot contain a quote"); }
     guard file_exists(swan_db) else { abort(str("spread-wings: no Swan map at ", swan_db)); }
     let db = open_map(db_path);
@@ -46,7 +49,6 @@ fn compiler_main(db_path: const u8[:], swan_db: const u8[:]) {
     }
 
     // Same code? The roots must match, and the map must say when it was built.
-    var root: u8[>..] = [];
     get_meta(db, "root", root);
     var sw_root: u8[>..] = [];
     var sw_real: u8[>..] = [];
@@ -60,6 +62,27 @@ fn compiler_main(db_path: const u8[:], swan_db: const u8[:]) {
     }
     let scip_time, when_ok = parse_int(when);
     guard when_ok && scip_time > 0 else { abort("spread-wings: the Swan map's SCIP time is not a number"); }
+    return db, scip_time;
+}
+
+// The files among a query's rows (file id, path, the mtime Swan left on it
+// or -1) that changed after the map's SCIP run, or are gone: Swan itself
+// calls such a file stale. A file Swan edited keeps the mtime Swan left.
+fn stale_files(db: i64, root: const u8[:], scip_time: i64, sql: const u8[:], stale: i64[>..]&) {
+    var err: u8[>..] = [];
+    let q = sqlite::prepare_or_die(db, sql);
+    while sqlite::step(q, err) == 1 {
+        var rel: u8[>..] = [];
+        sqlite::col_text(q, 1, rel);
+        let m = sw_mtime_ns(str(root, "/", rel));
+        if m < 0 || (m > scip_time && m != sqlite::col_int(q, 2)) { stale.push(sqlite::col_int(q, 0)); }
+    }
+    sqlite::finalize(q);
+}
+
+fn compiler_main(db_path: const u8[:], swan_db: const u8[:]) {
+    var root: u8[>..] = [];
+    let db, scip_time = attach_swan(db_path, swan_db, root);
 
     sqlite::exec_or_die(db, "BEGIN");
     sqlite::exec_or_die(db, """
@@ -73,21 +96,12 @@ fn compiler_main(db_path: const u8[:], swan_db: const u8[:]) {
     """);
 
     // Files changed since the map's SCIP run: not answered from this map.
-    // A file Swan edited itself keeps the mtime Swan left on it.
     var stale: i64[>..] = [];
-    var err: u8[>..] = [];
-    let q = sqlite::prepare_or_die(db, """
+    stale_files(db, root, scip_time, """
         SELECT DISTINCT s.file_id, s.path,
                COALESCE((SELECT f.edited_mtime FROM sw.files f WHERE f.file = s.path), -1)
         FROM sites s
-    """);
-    while sqlite::step(q, err) == 1 {
-        var rel: u8[>..] = [];
-        sqlite::col_text(q, 1, rel);
-        let m = sw_mtime_ns(str(root, "/", rel));
-        if m < 0 || (m > scip_time && m != sqlite::col_int(q, 2)) { stale.push(sqlite::col_int(q, 0)); }
-    }
-    sqlite::finalize(q);
+    """, stale);
     for id in stale { sqlite::exec_or_die(db, str("DELETE FROM sites WHERE file_id = ", id)); }
     let skipped = scalar(db, "SELECT n FROM nsites") - scalar(db, "SELECT COUNT(*) FROM sites");
 

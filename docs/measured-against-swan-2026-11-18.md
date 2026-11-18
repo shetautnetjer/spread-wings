@@ -90,3 +90,128 @@ file; in Swan, `occurrences` joined to `symbols` where `is_def = 0`,
 `by_name = 0`, same file, `start_line = row - 1`, same name. The script was
 run from a scratch folder and is short enough to rewrite from this
 description.
+
+# Second pass, same day: definitions by node kind, and the type a call names
+
+What changed: TypeScript, TSX, JavaScript and Rust definitions are read from
+the syntax tree by the kind of each node (src/treedefs.goose) in place of a
+list of shapes; calls are cut and tied by what their own form says
+(src/graph.goose); and the comparison above is a command,
+`spread-wings score <graph.db> <swan.db>`, so it can be run on any repo and
+language Swan maps. Same repos, same Swan maps, same judge. "Before" is
+609cecb scored by the new command; its links match the first pass above
+within a few (the first pass's script also counted uses on import lines).
+
+## Definitions the graph has, of those Swan has (same file, name and line)
+
+| Repo, language | Kind | In Swan | Before | After |
+|---|---|---|---|---|
+| rea, TypeScript | method | 4,188 | 0 | 4,188 |
+| | interface | 3,221 | 2,971 (92%) | 3,221 |
+| | type | 3,181 | 0 | 3,181 |
+| | class | 798 | 770 (96%) | 798 |
+| | constructor | 637 | 0 | 637 |
+| | function | 411 | 175 (43%) | 411 |
+| | getter | 215 | 0 | 215 |
+| Understand-Anything, TypeScript | function | 411 | 400 (97%) | 411 |
+| | method | 241 | 0 | 241 |
+| | interface | 134 | 123 (92%) | 134 |
+| | type | 48 | 0 | 48 |
+| relate, Rust | function | 18,785 | 17,835 (95%) | 18,627 (99%) |
+| | method | 6,145 | 5,693 (93%) | 6,133 |
+| | struct | 1,671 | 1,327 (79%) | 1,670 |
+| | enum | 892 | 796 (89%) | 890 |
+| | type | 230 | 0 | 218 (95%) |
+| | trait | 49 | 32 (65%) | 49 |
+
+Python was 100% on all four repos before and is unchanged.
+
+And of the definitions each repo's own call sites reach (any kind):
+
+| Repo, language | Kind in Swan | Reached | Before | After |
+|---|---|---|---|---|
+| rea, TypeScript | variable (a constant holding a function) | 20,192 | 4,213 (21%) | 20,163 |
+| | method | 3,856 | 0 | 3,856 |
+| | property | 710 | 0 | 456 (64%) |
+| | function | 400 | 170 (42%) | 400 |
+| | parameter | 146 | 0 | 1 |
+| relate, Rust | function | 8,460 | 7,742 (92%) | 8,460 |
+| | method | 4,787 | 4,448 (93%) | 4,783 |
+| | enum_member | 942 | 0 | 0 |
+| | field | 126 | 0 | 0 |
+
+## Links
+
+All rules together, per language of the calling file. "Right" is of the
+links Swan can judge. A call whose candidates share its weight has one link
+per candidate, so the last column counts calls: how many of the judged
+calls have the right link among theirs.
+
+| Repo, language | | Links | Judged | Right | Wrong | Calls with the right link |
+|---|---|---|---|---|---|---|
+| rea, TypeScript/JS | before | 172,407 | 82,788 | 35,990 (43%) | 46,798 | 35,556 of 55,961 (64%) |
+| | after | 276,371 | 206,297 | 180,763 (88%) | 25,534 | 176,714 of 181,546 (97%) |
+| | after `compiler` | 274,448 | 204,374 | 180,750 (88%) | 23,624 | 176,716 of 181,365 (97%) |
+| Understand-Anything, TypeScript/JS | before | 4,291 | 2,022 | 1,977 (98%) | 45 | 1,955 of 1,979 (99%) |
+| | after | 6,510 | 3,815 | 3,231 (85%) | 584 | 3,204 of 3,210 (100%) |
+| relate, Rust | before | 129,565 | 102,734 | 49,051 (48%) | 53,683 | 46,899 of 61,012 (77%) |
+| | after | 98,744 | 89,275 | 56,250 (63%) | 33,025 | 54,992 of 64,872 (85%) |
+| | after `compiler` | 70,762 | 61,293 | 55,954 (91%) | 5,339 | 54,992 of 58,394 (94%) |
+| relate, Python | before | 3,813 | 2,946 | 2,880 (98%) | 66 | 2,753 of 2,786 (99%) |
+| | after | 3,377 | 2,897 | 2,875 (99%) | 22 | 2,754 of 2,776 (99%) |
+| Agent-Reach, Python | before | 3,231 | 3,019 | 2,771 (92%) | 248 | 2,729 of 2,873 (95%) |
+| | after | 3,221 | 3,013 | 2,773 (92%) | 240 | 2,733 of 2,869 (95%) |
+
+(Understand-Anything's 584 wrong links are 578 `imported_file` links from
+one test file that imports ten parsers and calls `parser.analyzeFile(...)`:
+each call is linked to all ten `analyzeFile` methods, one of them right,
+for every one of the 712 calls.)
+
+By rule, after (links: right of judged):
+
+| Rule | rea, TypeScript | relate, Rust |
+|---|---|---|
+| own_type | 3,881: 3,854 of 3,854 (100%) | 5,072: 5,011 of 5,033 (100%) |
+| type_name | 611: 604 of 609 (99%) | 7,699: 7,439 of 7,613 (98%) |
+| same_file | 100,236: 66,006 of 67,019 (98%) | 21,738: 20,051 of 21,491 (93%) |
+| imported_name | 86,761: 85,593 of 86,711 (99%) | 2,681: 2,645 of 2,653 (100%) |
+| module_alias | 38: 38 of 38 | 81: 81 of 81 |
+| imported_file | 52,295: 21,930 of 43,319 (51%); the right link is among a call's for 19,712 of 22,311 calls (88%) | 6,510: 3,355 of 6,197 (54%); 3,189 of 5,038 calls (63%) |
+| by_name | 21,891: 2,738 of 4,747 (58%); 2,723 of 2,963 calls (92%) | 54,963: 17,668 of 46,207 (38%); 17,362 of 24,268 calls (72%) |
+
+## What the call's own form rules out (measured before each rule went in)
+
+| Rule | Links it removed | Of them right |
+|---|---|---|
+| A call on an object does not reach a plain function (Rust; TypeScript and JavaScript unless the object is the imported module) | rea 19,901; relate 9,381 | 471; 14 |
+| A bare call does not reach a method | relate 2,309 | 150, most to a function nested in a method, which is no longer counted a method |
+| A type is named and no candidate is that type's (`Vec::new()`, `Promise.all()`) | relate 5,211; rea 1,277 | 248; 3 |
+| `self.f()` whose own type has no f here: not tied by name | relate 911 | 0 |
+| A call does not reach a definition of another language | relate: Python by_name 26% to 100% right, JavaScript 356 links to 58 | |
+
+## Time
+
+The link step reads more definitions now. rea: index 10.1 s before, 17.3 s
+after (parse 2.3 to 2.8 s, link 7.8 to 14.5 s); relate 5.3 s and 5.1 s. One
+index was removed on the way (`defs(name)` beside `defs(name, sfile)`: with
+both, SQLite read every definition of a common method name for each import
+of each call, 13 s of a 29 s link step on rea).
+
+## Still open
+
+- **A call on an object whose type the code does not name** (`x.f()`) is
+  the bulk of what is left: `imported_file` and `by_name` for methods. The
+  `compiler` step settles only `by_name` calls; on rea most of the unsure
+  ones are `imported_file`, which it leaves alone. Letting Swan's answer
+  replace any guessed link, and add the links the rules could not make, is
+  the next step.
+- Rust enum variants (`Mode::On(x)`, 942 reached on relate) and TypeScript
+  parameters and non-function properties that are called are not
+  definitions.
+- relate's JavaScript: `imported_file` 130 right of 330.
+- Not read: keys of an object literal that hold a function, namespaces,
+  JSX element use (`<Panel />` is a use of Panel, and no call).
+- Java, Kotlin, C, C++, C#, PHP and Lua have grammars in goose-treesitter
+  and no reader here yet; Go has no grammar. `score` already lists what
+  Swan has for them (rea: 204 C++ functions, 62 Java methods; relate: 257
+  Go functions, 345 Java methods), all at 0.

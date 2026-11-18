@@ -41,63 +41,18 @@ bind	X	for $X in $I: $$$B
 bind	X	with $E as $X: $$$B
 """;
     }
+    // Rust, TypeScript, TSX and JavaScript definitions are read from the
+    // tree by node kind (treedefs.goose); only what is still read by shape
+    // is listed for them.
     if lang == "rust" {
         return """
-function	NAME	fn $NAME($$$A) -> $R { $$$B }
-function	NAME	fn $NAME($$$A) { $$$B }
-function	NAME	pub fn $NAME($$$A) -> $R { $$$B }
-function	NAME	pub fn $NAME($$$A) { $$$B }
-function	NAME	pub(crate) fn $NAME($$$A) -> $R { $$$B }
-function	NAME	pub(crate) fn $NAME($$$A) { $$$B }
-function	NAME	async fn $NAME($$$A) -> $R { $$$B }
-function	NAME	async fn $NAME($$$A) { $$$B }
-function	NAME	pub async fn $NAME($$$A) -> $R { $$$B }
-function	NAME	pub async fn $NAME($$$A) { $$$B }
-struct	NAME	struct $NAME { $$$B }
-struct	NAME	pub struct $NAME { $$$B }
-struct	NAME	struct $NAME($$$B);
-struct	NAME	pub struct $NAME($$$B);
-enum	NAME	enum $NAME { $$$B }
-enum	NAME	pub enum $NAME { $$$B }
-trait	NAME	trait $NAME { $$$B }
-trait	NAME	pub trait $NAME { $$$B }
-impl	T	impl $T { $$$B }
-impl	T	impl $TR for $T { $$$B }
-mod	NAME	mod $NAME;
-mod	NAME	pub mod $NAME;
 import	P	use $P;
 import	P	pub use $P;
 call	F	$F($$$A)
 """;
     }
-    if lang == "javascript" {
-        return """
-function	NAME	function $NAME($$$A) { $$$B }
-function	NAME	async function $NAME($$$A) { $$$B }
-function	NAME	const $NAME = ($$$A) => $B
-function	NAME	const $NAME = async ($$$A) => $B
-class	NAME	class $NAME { $$$B }
-class	NAME	class $NAME extends $S { $$$B }
-import	M	require($M)
-call	F	$F($$$A)
-assign	X	const $X = $F($$$A)
-assign	X	let $X = $F($$$A)
-bind	X	$X = $V
-bind	X	let $X = $V
-""";
-    }
-    // typescript, tsx
+    // javascript, typescript, tsx
     return """
-function	NAME	function $NAME($$$A) { $$$B }
-function	NAME	function $NAME($$$A): $T { $$$B }
-function	NAME	async function $NAME($$$A) { $$$B }
-function	NAME	async function $NAME($$$A): $T { $$$B }
-function	NAME	const $NAME = ($$$A) => $B
-function	NAME	const $NAME = async ($$$A) => $B
-class	NAME	class $NAME { $$$B }
-class	NAME	class $NAME extends $S { $$$B }
-class	NAME	class $NAME implements $$$I { $$$B }
-interface	NAME	interface $NAME { $$$B }
 import	M	require($M)
 call	F	$F($$$A)
 assign	X	const $X = $F($$$A)
@@ -140,7 +95,49 @@ fn callee_name(f: const u8[:]) -> const u8[:] {
     guard i < end else { return ""; }
     let c = f[i];
     guard !(c >= '0' && c <= '9') else { return ""; }
+    // A JavaScript private name keeps its `#`: `this.#seal()` calls `#seal`,
+    // which is not `seal`.
+    if i > 0 && f[i - 1] == '#' && (i == 1 || f[i - 2] == '.') { i--; }
     return f[i..end];
+}
+
+// The name right before a call's own name: `Pair` of `Pair::<T>::new`, `this`
+// of `this.push`, `store` of `self.store.flush`, `m` of `m?.f`. "" when the
+// call is bare, or what stands there is no plain name (`a.b().c`,
+// `rows[0].f`).
+fn qualifier_of(f: const u8[:]) -> const u8[:] {
+    var end = f.len;
+    if end > 0 && f[end - 1] == '>' {
+        let lt = find(f, "<");
+        if lt > 0 { end = lt; }
+    }
+    if end >= 2 && f[end - 2] == ':' && f[end - 1] == ':' { end = end - 2; }
+    var q = end;
+    while q > 0 && ident_char(f[q - 1]) { q--; }
+    if q > 0 && f[q - 1] == '#' { q--; }
+    if q >= 2 && f[q - 1] == ':' && f[q - 2] == ':' { q = q - 2; }
+    else if q >= 2 && f[q - 1] == '.' && f[q - 2] == '?' { q = q - 2; }
+    else if q >= 1 && f[q - 1] == '.' { q = q - 1; }
+    else { return ""; }
+    // The qualifier's own generic arguments: `Pair::<T>`, `Pair<T>`.
+    if q > 0 && f[q - 1] == '>' {
+        var depth = 0;
+        var k = q;
+        while k > 0 {
+            k--;
+            if f[k] == '>' { depth++; }
+            else if f[k] == '<' {
+                depth--;
+                if depth == 0 { break; }
+            }
+        }
+        q = k;
+        if q >= 2 && f[q - 1] == ':' && f[q - 2] == ':' { q = q - 2; }
+    }
+    var s = q;
+    while s > 0 && ident_char(f[s - 1]) { s--; }
+    guard s < q else { return ""; }
+    return f[s..q];
 }
 
 // The module an import names, quotes and braces trimmed: `"./m"` -> `./m`,
@@ -239,7 +236,7 @@ fn extract_repo(db: i64, repo: const u8[:]) -> i64 {
 
     let ins_sym = sqlite::prepare_or_die(db, "INSERT INTO symbols (file_id, name, kind, row, start, end_, end_row, sig, params) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)");
     let ins_imp = sqlite::prepare_or_die(db, "INSERT INTO imports (file_id, module, row, names) VALUES (?1, ?2, ?3, ?4)");
-    let ins_call = sqlite::prepare_or_die(db, "INSERT INTO calls (file_id, row, start, callee, in_symbol, text) VALUES (?1, ?2, ?3, ?4, 0, ?5)");
+    let ins_call = sqlite::prepare_or_die(db, "INSERT INTO calls (file_id, row, start, callee, in_symbol, text, qual) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)");
     let ins_asg = sqlite::prepare_or_die(db, "INSERT INTO assigns (file_id, row, start, name, value, in_symbol) VALUES (?1, ?2, ?3, ?4, ?5, 0)");
     for i in 0..pids.len {
         let fid = pids[i];
@@ -273,6 +270,8 @@ fn extract_repo(db: i64, repo: const u8[:]) -> i64 {
                 sqlite::bind_int(ins_call, 3, st);
                 sqlite::bind_text(ins_call, 4, f[1]);
                 sqlite::bind_text(ins_call, 5, f[2]);
+                // (A Goose call's text is the rest of its line, and Goose has no methods.)
+                sqlite::bind_text(ins_call, 6, if all_langs[i] == "goose" { "" } else { qualifier_of(f[2]) });
                 sqlite::step_done(ins_call);
             } else {
                 sqlite::reset(ins_sym);
@@ -302,12 +301,14 @@ fn extract_repo(db: i64, repo: const u8[:]) -> i64 {
     sqlite::exec_or_die(db, """
         DELETE FROM symbols WHERE id NOT IN (
             SELECT MIN(id) FROM symbols GROUP BY file_id, start, name);
-        -- A method's container: the innermost class, struct, trait, interface
-        -- or impl that spans it.
+        -- A method's container: the class, struct, trait, interface, impl or
+        -- (TypeScript) object type it sits in. A function inside another
+        -- function is no method, whatever class is further out: the
+        -- innermost definition around it decides.
         UPDATE symbols SET container = (
-            SELECT c.name FROM symbols c
+            SELECT CASE WHEN c.kind = 'function' THEN NULL ELSE c.name END FROM symbols c
             WHERE c.file_id = symbols.file_id AND c.id != symbols.id
-              AND c.kind IN ('class', 'struct', 'trait', 'interface', 'impl')
+              AND c.kind IN ('class', 'struct', 'trait', 'interface', 'impl', 'type', 'function')
               AND c.start <= symbols.start AND symbols.end_ <= c.end_
             ORDER BY c.end_ - c.start LIMIT 1)
         WHERE kind = 'function';
@@ -508,6 +509,11 @@ fn goose_scan(text: const u8[:], out: u8[>..]&) {
 }
 
 thread_fn extract_worker() {
+    // What the tree reader learned about the kinds of one language, and an
+    // empty tree of that language to ask about them (treedefs.goose).
+    var kinds_lang: u8[..16] = [];
+    var kinds_tree = 0;
+    var kinds: i64[>..] = [];
     loop {
         let job = qget<FileJob>();
         guard job.idx >= 0 else { break; }
@@ -522,6 +528,16 @@ thread_fn extract_worker() {
             treesitter::t_text.clear();
             treesitter::t_text.append(text);
             if treesitter::parse(job.lang, treesitter::t_text, treesitter::t_nodes) {
+                if reads_by_kind(job.lang) {
+                    if kinds_lang != job.lang {
+                        if kinds_tree != 0 { treesitter::swan_ts_free(kinds_tree); }
+                        kinds_tree = treesitter::swan_ts_parse(job.lang, "");
+                        kinds_lang.clear();
+                        kinds_lang.append(job.lang);
+                        kinds.clear();
+                    }
+                    if kinds_tree != 0 { tree_definitions(job.lang, kinds_tree, kinds, done.data); }
+                }
                 each_split(patterns(job.lang), '\n') { line =>
                     let f = split(line, '\t');
                     if f.len == 3 {
@@ -701,20 +717,36 @@ fn one_line(s: const u8[:], n: i64) -> u8[>..] {
     return out;
 }
 
+let PARAM_WORDS = ["mut", "public", "private", "protected", "readonly", "override"];
+
 // The parameter names of a function header, as ",a,b,c,": the pieces of its
 // first parenthesised list, split at top-level commas, each one's leading
 // name (`*args`, `**kw`, `mut x`, `x: T = d`, `x = d` all give their name).
 // Types, defaults and anything nested are not names. "" when there are none.
 fn param_names(header: const u8[:]) -> u8[>..] {
     var out: u8[>..] = [];
-    let open = find(header, "(");
-    guard open >= 0 else { return out; }
+    // Rust's `pub(crate) fn f(a)`: the visibility's parentheses are not the list.
+    var skip = 0;
+    if starts_with(header, "pub(") {
+        let close = find(header, ")");
+        if close > 0 { skip = close + 1; }
+    }
+    let at = find(header[skip..], "(");
+    guard at >= 0 else { return out; }
+    let open = skip + at;
     var depth = 0;
     var piece: u8[>..] = [];
     fn take() {
         var p = trim(piece);
         while p.len > 0 && (p[0] == '*' || p[0] == '&') { p = trim(p[1..]); }
-        if starts_with(p, "mut ") { p = trim(p[4..]); }
+        // Rust's `mut x`, and a TypeScript constructor's `private readonly x`.
+        var again = true;
+        while again {
+            again = false;
+            for w in PARAM_WORDS {
+                if p.len > w.len && starts_with(p, w) && p[w.len] == ' ' { p = trim(p[w.len..]); again = true; }
+            }
+        }
         var n = 0;
         while n < p.len && ((p[n] >= 'a' && p[n] <= 'z') || (p[n] >= 'A' && p[n] <= 'Z') || (p[n] >= '0' && p[n] <= '9') || p[n] == '_' || p[n] == '$') { n++; }
         if n > 0 && !(p[0] >= '0' && p[0] <= '9') {

@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS symbols (
 CREATE TABLE IF NOT EXISTS imports (file_id INTEGER, module TEXT, row INTEGER, names TEXT, dst INTEGER);
 CREATE TABLE IF NOT EXISTS calls (
     file_id INTEGER, row INTEGER, start INTEGER, callee TEXT, in_symbol INTEGER, text TEXT,
-    note TEXT);
+    note TEXT,
+    qual TEXT);     -- the name right before the callee's: `Pair` of `Pair::new`, `this` of `this.push`; "" for none
 CREATE TABLE IF NOT EXISTS assigns (
     file_id INTEGER, row INTEGER, start INTEGER, name TEXT, value TEXT, in_symbol INTEGER);
 CREATE INDEX IF NOT EXISTS assigns_scope ON assigns(file_id, name);
@@ -57,7 +58,7 @@ fn open_fresh(path: const u8[:]) -> i64 {
 // up whenever they change; a graph written with another number is rebuilt,
 // not read: indexing takes seconds, and a command that met a missing column
 // used to stop with a raw SQL error.
-let SCHEMA_NUMBER = "7";
+let SCHEMA_NUMBER = "8";
 
 fn open_map(path: const u8[:]) -> i64 {
     var err: u8[>..] = [];
