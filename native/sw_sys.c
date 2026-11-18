@@ -42,6 +42,24 @@ int64_t sw_mtime_ns(sw_slice path) {
     return (int64_t)st.st_mtim.tv_sec * 1000000000LL + (int64_t)st.st_mtim.tv_nsec;
 }
 
+/* When the file's inode last changed (a write, a rename onto it, a restore
+   that keeps the old mtime), in ns since the epoch, and its size in bytes;
+   -1 if it cannot be read. With the mtime, what `update` compares before it
+   reads a file again. */
+int64_t sw_ctime_ns(sw_slice path) {
+    char buf[4096];
+    struct stat st;
+    if (!to_cstr(path, buf, sizeof buf) || stat(buf, &st) != 0) return -1;
+    return (int64_t)st.st_ctim.tv_sec * 1000000000LL + (int64_t)st.st_ctim.tv_nsec;
+}
+
+int64_t sw_file_size(sw_slice path) {
+    char buf[4096];
+    struct stat st;
+    if (!to_cstr(path, buf, sizeof buf) || stat(buf, &st) != 0) return -1;
+    return (int64_t)st.st_size;
+}
+
 /* Whether an environment variable is set and not empty. The decision step
    asks this about its API key: the key itself is only ever read by the HTTP
    helper, in C, so it never sits in a Goose buffer. */

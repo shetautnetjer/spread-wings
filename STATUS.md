@@ -183,3 +183,137 @@ Limits:
   different answers are left alone, as before.
 - The graph is as good as the map is fresh: files changed since the map
   was built are skipped and counted.
+
+## 2026-11-18: `update`, the graph from the files that changed
+
+What was wrong: `index` builds the whole graph every time. On morluto/rea
+that is 17 s (2.8 s reading files, 14.2 s tying calls to definitions)
+for a one-line edit: too slow to run after every change, and the reason
+Swan rebuilds its copy of the graph only when its own map is rebuilt.
+
+- `spread-wings update <repo> <graph.db>` (src/update.goose) brings a
+  graph up to date. It compares each file with a stamp `index` and
+  `update` now keep (size, modification time, inode change time, content
+  hash; table `stamps`), reads again only the files whose content changed,
+  and ties again only the calls a change can reach. One JSON object says
+  what it did: files changed, added, removed; calls tied again and the
+  files they are in.
+- The graph it leaves is the one `index` builds from the same files, row
+  numbers apart. tests/graph_dump.py prints a graph without row numbers
+  and the two are compared.
+- The link script is the one `index` runs (`LINK_CALLS_SQL`), on a list of
+  calls: `/*dirty: ... */` comments in it are opened into filters. The
+  list (set out at the top of src/update.goose): every call of a file read
+  again; every call, anywhere, of a name whose definitions in a changed
+  file are not what they were (for a name defined in more than 50 places,
+  only in the files that import the changed file: such a name is never
+  tied further than that); the names a changed import line passes on;
+  everything, when a file added or removed changes the repo's top-level
+  names, or when the list would hold more than two calls in five. A
+  function whose body alone changed keeps its callers' links, moved to its
+  new row.
+- `index` writes the same graphs as before (rea, relate,
+  Understand-Anything, Agent-Reach: the dumps are identical to those of
+  7beddf2, weights to the last digit) in the same time. Three things in it
+  no longer hang on the order of rows: a file's node in the clustering is
+  its place in the walk, weights are summed smallest first, and a choice
+  between two equally short paths is spelled out.
+- `RULES_NUMBER` (src/store.goose) numbers what `index` writes for a repo;
+  a graph written under another number is built whole by `update`. A check
+  holds the fixtures' graphs to the number.
+
+| | `index` | `update`, nothing changed | one file edited | a file added or removed |
+|---|---|---|---|---|
+| rea (7,784 files, 744,582 call sites) | 17.0 s | 0.02 s | 0.26 to 0.29 s | 1.2 s |
+| relate (2,078 files, 183,859 call sites) | 5.0 s | 0.01 s | 0.10 to 0.17 s | 1.1 s |
+| Understand-Anything (324 files) | 0.24 s | under 0.01 s | 0.02 s | 0.03 s |
+| Agent-Reach (87 files) | 0.12 s | under 0.01 s | 0.01 s | 0.04 s |
+
+Checked:
+- 55 new checks, 157 pass in the microVM
+  (`SW_SPACE_CHECKPOINT=swan-test-v4 scripts/space-test.sh`): a repo made
+  of the fixtures, then one change at a time (a line above a file's
+  functions, a function renamed, a file added, renamed, removed, lines
+  taken out of Rust, TypeScript, JavaScript, Goose and Python files, a new
+  folder at the top, a file touched, a file changed and given back its old
+  time, a 60th definition of a name and ten of them removed), the updated
+  graph compared with a fresh one after each; what the answer lists; the
+  graphs it builds whole and why.
+- Each check was seen to fail on a build with the fault it is there for:
+  the build before this change (no `update`: 49 of the 55 fail, and the
+  other six state what holds without it, the rules hash among them);
+  imports found through the index they are written to (an import tied
+  twice: 4 links where 2 belong); the top-level names read after the new files had rows (a call
+  left "outside the repo" that no longer was); inode time not compared (a
+  restored file missed); links not moved to a definition's new row (callers
+  in other files tied again); the importers of a file left out for a name
+  defined in more than 50 places (a link missing); the two-in-five switch
+  left out (the answer says a list was tied, not all).
+- Random changes on copies of real repos, 1 to 3 at a time out of 20 kinds
+  (edits, appended and renamed functions, imports dropped and borrowed,
+  files copied, moved, swapped, deleted, folders moved, `__init__.py`
+  added and removed, new top-level folders), the updated graph compared
+  with a fresh one after every batch. On the final build: Agent-Reach 100
+  rounds, Understand-Anything 100, this repo (Goose) 60, relate 20, rea 8;
+  1,001 rounds over the day's builds. None differed.
+
+Found by measuring, and fixed before this entry:
+- An import read through the index on the column being written came round
+  twice (the classic update-while-scanning fault). The imports to tie are
+  now listed first. `index` was not affected (it reads them in row order).
+- A link to a removed definition could come to name a new one that took
+  its row number. New rows now never take a number just freed in the same
+  update.
+- The first version tied again every call of every name a changed file
+  defined or imported: 3,399 of 7,200 calls on Agent-Reach for two
+  functions appended to a test file. Comparing the definitions and import lines
+  before and after brought that to the file's own calls.
+- Moving a folder of 149 test files on rea tied again 568,459 of its
+  744,581 calls and took 23.6 s, longer than `index`. Two causes: the
+  names on the import lines of every moved file were counted as passed on,
+  though nothing imports from a test file (now only a file something
+  imports from passes names on); and the script run on a list pays for
+  the list at every statement (now, past two calls in five, all calls are
+  tied the way `index` ties them). With those, and the two narrowings in
+  the next point, the same move takes 5.6 s and ties 57,040 calls again.
+- Two narrowings that came out of that move: a name defined in more than
+  50 places (`it`, `close`, `run`) is redone only in the files that import
+  the changed file; and the calls of a file that binds a variable from a
+  call of a changed name are redone only when some definition of the name
+  says what it returns, since nothing else is read off it.
+- A second of every update on rea went to work that did not depend on the
+  change: finding the groups again (0.7 s; now skipped when the files and
+  the links between them are as they were) and four statements reading
+  every call (0.3 s; now only the listed ones).
+
+Found and not done:
+- `overview` takes 94 s on rea (93.8 s on the build before this one too):
+  its "most called" query joins definitions to call links, which have no
+  index on the definition. Swan's `repo_overview` waits on it. Its own
+  change.
+
+Limits:
+- Swan does not use it yet: it still runs `index` and `compiler` when its
+  map is rebuilt. And `update` keeps a graph of the rules alone: one
+  holding `compiler` or `decide` answers is built whole, and says so. How
+  compiler answers stay on an updated graph is part of the next step (the
+  watcher).
+- A file added or removed costs about a second on rea and on relate:
+  every import is tied again and the groups are found again. When it
+  changes the repo's top-level names (a new folder at the top, a Python
+  package folder), every call is tied again, which is `index`'s link step
+  (14 s on rea). A folder of 149 test files moved: 5.6 s.
+- An edit that changes the links between files (a new import, a first
+  call into another file) has the groups found again: 0.7 s more on rea.
+- A change to an import line that names a file of the repo, in a file
+  that other files import from, ties again every call of the names on
+  that line, anywhere; so does a change to the definitions of a common
+  name. Right, and sometimes wide. Past two calls in five it costs what
+  `index`'s link step costs.
+- A file edited in the last three seconds is read once more at the next
+  update (its times are not trusted yet). That costs a read, not a parse.
+- Two updates of one graph at once: the second stops with SQLite's
+  "database is locked", and the graph is the first one's.
+- Row numbers in an updated graph are not those of a fresh one. Nothing in
+  Spread-Wings reads meaning into them; `decide` asks its questions in
+  row order, so under `--max` it may ask a different subset.

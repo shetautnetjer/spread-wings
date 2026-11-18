@@ -80,18 +80,20 @@ fn first_file(st: i64, like_st: i64, pkg_st: i64, candidates: const u8[:]) -> i6
 // start with that folder's). So `import mypkg.core` finds
 // python/mypkg/core.py, and does not find a/b/mypkg/core.py when a/b is a
 // package. pysuf holds every such ending of every Python path, so one
-// import is one indexed lookup; the shortest path wins.
+// import is one indexed lookup; the shortest path wins, and of two as short
+// the one the walk met first (`ord`: a file's row number says that only in
+// a graph no update has added files to).
 let PKG_SUFFIX_SQL = """
-    CREATE TEMP TABLE pysuf (suffix TEXT, id INTEGER, len INTEGER);
+    CREATE TEMP TABLE pysuf (suffix TEXT, id INTEGER, len INTEGER, ord INTEGER);
     WITH RECURSIVE s(id, path, rest) AS (
         SELECT id, path, substr(path, instr(path, '/') + 1) FROM files
         WHERE lang = 'python' AND instr(path, '/') > 0
         UNION ALL
         SELECT id, path, substr(rest, instr(rest, '/') + 1) FROM s WHERE instr(rest, '/') > 0)
-    INSERT INTO pysuf SELECT rest, id, length(path) FROM s
+    INSERT INTO pysuf SELECT rest, id, length(path), COALESCE((SELECT t.ord FROM stamps t WHERE t.file_id = s.id), s.id) FROM s
         WHERE NOT EXISTS (SELECT 1 FROM files g
                           WHERE g.path = substr(s.path, 1, length(s.path) - length(s.rest)) || '__init__.py');
-    CREATE INDEX pysuf_suffix ON pysuf(suffix, len, id);
+    CREATE INDEX pysuf_suffix ON pysuf(suffix, len, ord, id);
 """;
 
 // Candidate files for one import, best first, one per line.
@@ -208,15 +210,31 @@ fn add_alias(st: i64, file: i64, alias: const u8[:], dst: i64) {
     sqlite::step_done(st);
 }
 
-fn link_imports(db: i64) -> i64 {
+// Ties each import to the file it names. With only_changed (update), only
+// the imports of the files read again (temp.u_changed): theirs are new rows.
+fn link_imports(db: i64, only_changed: bool = false) -> i64 {
     var err: u8[>..] = [];
-    let q = sqlite::prepare_or_die(db, "SELECT i.file_id, f.path, f.lang, i.module, i.rowid, COALESCE(i.names, '') FROM imports i JOIN files f ON f.id = i.file_id");
+    // The imports to tie are listed first, then read from the list: the
+    // loop below writes each one's file into the row it came from, and a
+    // row found through an index on what is being written (which is how
+    // the imports of a few files are found) can come round a second time.
+    sqlite::exec_or_die(db, open_marks("""
+        DROP TABLE IF EXISTS temp.imp_todo;
+        CREATE TEMP TABLE imp_todo AS
+            SELECT i.file_id, f.path, f.lang, i.module, i.rowid AS r, COALESCE(i.names, '') AS names
+            FROM imports i JOIN files f ON f.id = i.file_id
+            /*only: WHERE i.file_id IN (SELECT id FROM temp.u_changed) */
+            ORDER BY i.rowid;
+    """, "only", only_changed));
+    let q = sqlite::prepare_or_die(db, "SELECT file_id, path, lang, module, r, names FROM temp.imp_todo ORDER BY rowid");
     let ins_alias = sqlite::prepare_or_die(db, "INSERT INTO aliases (file_id, alias, dst) VALUES (?1, ?2, ?3)");
     let set_dst = sqlite::prepare_or_die(db, "UPDATE imports SET dst = ?2 WHERE rowid = ?1");
     let find_st = sqlite::prepare_or_die(db, "SELECT id FROM files WHERE path = ?1");
-    let like_st = sqlite::prepare_or_die(db, "SELECT id FROM files WHERE path LIKE ?1 ORDER BY length(path) LIMIT 1");
+    // (Of two paths as short, the first by name: said outright, so that the
+    // answer does not hang on the order rows happen to be read in.)
+    let like_st = sqlite::prepare_or_die(db, "SELECT id FROM files WHERE path LIKE ?1 ORDER BY length(path), path LIMIT 1");
     sqlite::exec_or_die(db, PKG_SUFFIX_SQL);
-    let pkg_st = sqlite::prepare_or_die(db, "SELECT id FROM pysuf WHERE suffix = ?1 ORDER BY len, id LIMIT 1");
+    let pkg_st = sqlite::prepare_or_die(db, "SELECT id FROM pysuf WHERE suffix = ?1 ORDER BY len, ord, id LIMIT 1");
     let ins = sqlite::prepare_or_die(db, "INSERT INTO file_edges (src, dst, kind, weight) VALUES (?1, ?2, 'import', 1.0)");
     var n: i64 = 0;
     while sqlite::step(q, err) == 1 {
@@ -272,7 +290,7 @@ fn link_imports(db: i64) -> i64 {
     sqlite::finalize(find_st);
     sqlite::finalize(like_st);
     sqlite::finalize(pkg_st);
-    sqlite::exec_or_die(db, "DROP TABLE pysuf");
+    sqlite::exec_or_die(db, "DROP TABLE pysuf; DROP TABLE temp.imp_todo");
     sqlite::finalize(set_dst);
     sqlite::finalize(ins_alias);
     sqlite::finalize(ins);
@@ -292,8 +310,53 @@ fn link_imports(db: i64) -> i64 {
 //                  at most 8 places).
 // Several definitions at one level share the call's weight. The rule used
 // is stored on the link as `resolution`.
-fn link_calls(db: i64) {
+//
+// With only_dirty (update), only the calls listed in temp.dirty are tied,
+// with temp.dirty_files holding the files they are in: every other call
+// keeps the links and the note it has. What a call's answer hangs on, and
+// so which calls update must list, is set out in update.goose.
+fn link_calls(db: i64, only_dirty: bool = false) {
+    make_roots(db);
+    sqlite::exec_or_die(db, open_marks(LINK_CALLS_SQL, "dirty", only_dirty));
+    call_file_edges(db, only_dirty);
+}
+
+// The repo's own top-level names: an import whose first segment is none of
+// them comes from outside the repo. They hang on the paths of the files
+// alone, so update compares roots_text before and after: when a file added
+// or removed changes them, any call may be outside that was not, and all
+// are tied again.
+fn make_roots(db: i64) {
     sqlite::exec_or_die(db, """
+        DROP TABLE IF EXISTS temp.roots;
+        CREATE TEMP TABLE roots AS
+            SELECT DISTINCT substr(path, 1, instr(path || '/', '/') - 1) AS seg FROM files
+            UNION SELECT DISTINCT replace(substr(path, 1, instr(path || '/', '/') - 1), '-', '_') FROM files
+            UNION SELECT DISTINCT replace(path, '.py', '') FROM files WHERE instr(path, '/') = 0
+            UNION SELECT DISTINCT substr(substr(path, 5), 1, instr(substr(path, 5) || '/', '/') - 1)
+                  FROM files WHERE path LIKE 'src/%'
+            -- every folder that is a Python package, wherever it is kept
+            UNION SELECT DISTINCT replace(d, rtrim(d, replace(d, '/', '')), '')
+                  FROM (SELECT substr(path, 1, length(path) - 12) AS d FROM files WHERE substr(path, -12) = '/__init__.py')
+            UNION SELECT 'crate' UNION SELECT 'self' UNION SELECT 'super' UNION SELECT '';
+    """);
+}
+
+fn roots_text(db: i64) -> u8[>..] {
+    make_roots(db);
+    var err: u8[>..] = [];
+    var out: u8[>..] = [];
+    let st = sqlite::prepare_or_die(db, "SELECT seg FROM temp.roots ORDER BY seg");
+    while sqlite::step(st, err) == 1 {
+        sqlite::col_text(st, 0, out);
+        out.push('\n');
+    }
+    sqlite::finalize(st);
+    sqlite::exec_or_die(db, "DROP TABLE temp.roots");
+    return out;
+}
+
+let LINK_CALLS_SQL = """
         CREATE TEMP TABLE defs AS
             SELECT s.id AS sid, s.file_id AS sfile, s.name AS name FROM symbols s
             WHERE s.kind IN ('function', 'class', 'struct', 'enum', 'trait', 'interface');
@@ -315,17 +378,19 @@ fn link_calls(db: i64) {
             SELECT c.rowid AS cid, c.file_id AS cfile, c.callee AS name, d.sid, d.sfile, k.n
             FROM calls c JOIN ndefs k ON k.name = c.callee AND k.n <= 50
             JOIN defs d ON d.name = c.callee
+            /*dirty: WHERE c.rowid IN (SELECT cid FROM temp.dirty) */
             UNION ALL
             SELECT c.rowid, c.file_id, c.callee, d.sid, d.sfile, k.n
             FROM calls c JOIN ndefs k ON k.name = c.callee AND k.n > 50
             JOIN defs d ON d.name = c.callee AND d.sfile = c.file_id
+            /*dirty: WHERE c.rowid IN (SELECT cid FROM temp.dirty) */
             UNION ALL
             -- (CROSS JOIN keeps this order: the few common names first.)
             SELECT DISTINCT c.rowid, c.file_id, c.callee, d.sid, d.sfile, k.n
             FROM ndefs k CROSS JOIN calls c ON c.callee = k.name
             CROSS JOIN imports i ON i.file_id = c.file_id AND i.dst > 0 AND i.dst <> c.file_id
             CROSS JOIN defs d ON d.name = c.callee AND d.sfile = i.dst
-            WHERE k.n > 50;
+            WHERE k.n > 50 /*dirty: AND c.rowid IN (SELECT cid FROM temp.dirty) */;
         CREATE INDEX cands_cid ON cands(cid);
         -- A call reaches a definition of its own language: a TypeScript
         -- `open()` is not the Rust `fn open` of the same repo. TypeScript,
@@ -343,7 +408,7 @@ fn link_calls(db: i64) {
           AND cid IN (SELECT k.rowid FROM calls k JOIN files f ON f.id = k.file_id
                       WHERE f.lang IN ('typescript', 'tsx', 'javascript', 'rust')
                         AND length(COALESCE(k.text, '')) > length(k.callee) + 1
-                        AND substr(k.text, -(length(k.callee) + 1)) = '.' || k.callee)
+                        AND substr(k.text, -(length(k.callee) + 1)) = '.' || k.callee /*dirty: AND k.rowid IN (SELECT cid FROM temp.dirty) */)
           AND NOT EXISTS (SELECT 1 FROM calls k JOIN imports i ON i.file_id = k.file_id AND i.dst = cands.sfile
                           WHERE k.rowid = cands.cid
                             AND instr(',' || REPLACE(COALESCE(i.names, ''), '@', '') || ',',
@@ -358,7 +423,7 @@ fn link_calls(db: i64) {
         DELETE FROM cands WHERE sid IN (SELECT id FROM symbols WHERE COALESCE(container, '') = '')
           AND cid IN (
             SELECT k.rowid FROM calls k
-            WHERE instr(COALESCE(k.text, ''), '.') > 1
+            WHERE instr(COALESCE(k.text, ''), '.') > 1 /*dirty: AND k.rowid IN (SELECT cid FROM temp.dirty) */
               AND (EXISTS (SELECT 1 FROM assigns a WHERE a.file_id = k.file_id AND a.in_symbol IN (k.in_symbol, 0)
                            AND a.name = substr(k.text, 1, instr(k.text, '.') - 1))
                    OR EXISTS (SELECT 1 FROM symbols s WHERE s.id = k.in_symbol
@@ -382,7 +447,8 @@ fn link_calls(db: i64) {
                        AND b.in_symbol = calls.in_symbol)
                OR EXISTS (SELECT 1 FROM symbols s WHERE s.id = calls.in_symbol
                           AND instr(COALESCE(s.params, ''), ',' || calls.callee || ',') > 0));
-        INSERT OR IGNORE INTO done SELECT rowid FROM calls WHERE note = 'local_value';
+        INSERT OR IGNORE INTO done SELECT rowid FROM calls WHERE note = 'local_value'
+            /*dirty: AND rowid IN (SELECT cid FROM temp.dirty) */;
 
         -- A bare call (`f(x)`) is not a call of a method: a method is reached
         -- through an object or a type. (Against Swan on relatedb/relate,
@@ -393,7 +459,7 @@ fn link_calls(db: i64) {
         -- value it is, whatever else has its name.)
         DELETE FROM cands WHERE sid IN (SELECT id FROM symbols WHERE COALESCE(container, '') <> '')
           AND cid IN (SELECT k.rowid FROM calls k
-                      WHERE instr(COALESCE(k.text, k.callee), '.') = 0 AND instr(COALESCE(k.text, k.callee), '::') = 0);
+                      WHERE instr(COALESCE(k.text, k.callee), '.') = 0 AND instr(COALESCE(k.text, k.callee), '::') = 0 /*dirty: AND k.rowid IN (SELECT cid FROM temp.dirty) */);
 
         -- The type the call itself names. `this.f()`, `self.f()` and
         -- `Self::f()` are the f of the type the calling method belongs to;
@@ -430,7 +496,7 @@ fn link_calls(db: i64) {
         -- methods of other types are not what is called. (relate: 5,211 such
         -- Rust links, 248 right; rea: 1,277 TypeScript links, 3 right.)
         DELETE FROM cands WHERE cid NOT IN (SELECT cid FROM done)
-          AND cid IN (SELECT k.rowid FROM calls k WHERE k.qual GLOB '[A-Z]*[a-z]*' AND k.qual <> 'Self')
+          AND cid IN (SELECT k.rowid FROM calls k WHERE k.qual GLOB '[A-Z]*[a-z]*' AND k.qual <> 'Self' /*dirty: AND k.rowid IN (SELECT cid FROM temp.dirty) */)
           AND sid IN (SELECT id FROM symbols WHERE COALESCE(container, '') <> '');
 
         INSERT INTO chosen SELECT cid, sid, 'same_file' FROM cands WHERE sfile = cfile AND cid NOT IN (SELECT cid FROM done);
@@ -451,7 +517,11 @@ fn link_calls(db: i64) {
             SELECT k.rowid, d.sid, 'imported_name' FROM calls k
             JOIN fn_alias a ON a.file_id = k.file_id AND a.bound = k.callee
             JOIN defs d ON d.name = a.orig AND d.sfile = a.dst
-            WHERE k.rowid NOT IN (SELECT cid FROM done) AND instr(COALESCE(k.text, k.callee), '.') = 0;
+            WHERE k.rowid NOT IN (SELECT cid FROM done) AND instr(COALESCE(k.text, k.callee), '.') = 0
+              -- (EXISTS, not IN: a filter on the rows the joins above give.
+              -- As a list to start from, it had SQLite read the renamed
+              -- imports once per listed call: 1.2 s for 64,385 calls.)
+              /*dirty: AND EXISTS (SELECT 1 FROM temp.dirty z WHERE z.cid = k.rowid) */;
         INSERT OR IGNORE INTO done SELECT cid FROM chosen;
         DROP TABLE fn_alias;
 
@@ -541,22 +611,14 @@ fn link_calls(db: i64) {
                           WHERE k.cid = calls.rowid)
           AND NOT EXISTS (SELECT 1 FROM cands k JOIN aliases a ON a.file_id = k.cfile AND a.dst = k.sfile
                           WHERE k.cid = calls.rowid);
-        INSERT OR IGNORE INTO done SELECT rowid FROM calls WHERE note = 'builtin_method';
+        INSERT OR IGNORE INTO done SELECT rowid FROM calls WHERE note = 'builtin_method'
+            /*dirty: AND rowid IN (SELECT cid FROM temp.dirty) */;
 
         -- Names bound by an import from outside the repo (`import shutil`,
         -- `import networkx as nx`, `from unittest.mock import patch`,
         -- `use std::fs`, `import React from "react"`): an import with no file,
         -- whose first segment isn't one of the repo's own top-level names.
-        CREATE TEMP TABLE roots AS
-            SELECT DISTINCT substr(path, 1, instr(path || '/', '/') - 1) AS seg FROM files
-            UNION SELECT DISTINCT replace(substr(path, 1, instr(path || '/', '/') - 1), '-', '_') FROM files
-            UNION SELECT DISTINCT replace(path, '.py', '') FROM files WHERE instr(path, '/') = 0
-            UNION SELECT DISTINCT substr(substr(path, 5), 1, instr(substr(path, 5) || '/', '/') - 1)
-                  FROM files WHERE path LIKE 'src/%'
-            -- every folder that is a Python package, wherever it is kept
-            UNION SELECT DISTINCT replace(d, rtrim(d, replace(d, '/', '')), '')
-                  FROM (SELECT substr(path, 1, length(path) - 12) AS d FROM files WHERE substr(path, -12) = '/__init__.py')
-            UNION SELECT 'crate' UNION SELECT 'self' UNION SELECT 'super' UNION SELECT '';
+        -- (temp.roots: make_roots, before this script.)
         CREATE TEMP TABLE ext (file_id INTEGER, name TEXT, module TEXT);
         WITH RECURSIVE
             imp AS (SELECT file_id, module, COALESCE(names, '') AS names,
@@ -583,7 +645,8 @@ fn link_calls(db: i64) {
                 CASE WHEN instr(replace(COALESCE(text, callee), '::', '.'), '.') > 0
                      THEN substr(replace(text, '::', '.'), 1, instr(replace(text, '::', '.'), '.') - 1)
                      ELSE callee END);
-        INSERT OR IGNORE INTO done SELECT rowid FROM calls WHERE note = 'external';
+        INSERT OR IGNORE INTO done SELECT rowid FROM calls WHERE note = 'external'
+            /*dirty: AND rowid IN (SELECT cid FROM temp.dirty) */;
 
         -- A bare call to a Python builtin (`set()`, `len()`, `sorted()`) the
         -- file neither defines nor imports.
@@ -601,7 +664,8 @@ fn link_calls(db: i64) {
                          'locals', 'dir', 'slice', 'bytearray', 'memoryview', 'complex')
           AND NOT EXISTS (SELECT 1 FROM imports i WHERE i.file_id = calls.file_id
                           AND (',' || i.names || ',') LIKE ('%,' || calls.callee || ',%'));
-        INSERT OR IGNORE INTO done SELECT rowid FROM calls WHERE note = 'builtin';
+        INSERT OR IGNORE INTO done SELECT rowid FROM calls WHERE note = 'builtin'
+            /*dirty: AND rowid IN (SELECT cid FROM temp.dirty) */;
 
         -- Variables holding outside objects: `G = nx.Graph()`, `m = re.match(...)`,
         -- `with open(p) as f`, `parser = ArgumentParser()`, or a parameter
@@ -624,7 +688,8 @@ fn link_calls(db: i64) {
             CASE WHEN instr(v, '.') > 0 THEN substr(v, 1, instr(v, '.') - 1) ELSE v END AS vroot,
             instr(v, '.') = 0 AS bare, it, 0 AS ok, 0 AS lib
             FROM (SELECT file_id, in_symbol, name, value LIKE 'iter:%' AS it,
-                         CASE WHEN value LIKE 'iter:%' THEN substr(value, 6) ELSE value END AS v FROM assigns);
+                         CASE WHEN value LIKE 'iter:%' THEN substr(value, 6) ELSE value END AS v FROM assigns
+                         /*dirty: WHERE file_id IN (SELECT id FROM temp.dirty_files) */);
         -- importlib.import_module / reload and __import__ return modules,
         -- which can be this repo's own: never outside objects, under any
         -- name they were imported as (`import importlib as il`).
@@ -643,7 +708,7 @@ fn link_calls(db: i64) {
                 WHERE s.id = d.sid AND s.sig IS NOT NULL AND instr(s.sig, '->') > 0 AND instr(s.sig, x.name) > 0
                   AND (s.sig GLOB '*-> ' || x.name || '[^A-Za-z0-9_]*' OR s.sig GLOB '*-> "' || x.name || '[^A-Za-z0-9_]*'
                        OR s.sig GLOB '*-> Optional[[]' || x.name || '[^A-Za-z0-9_]*')) AS out
-            FROM defs d;
+            FROM defs d /*dirty: WHERE d.name IN (SELECT vroot FROM asg) */;
         CREATE INDEX retdef_name ON retdef(name, sfile);
         CREATE TEMP TABLE extvar (file_id INTEGER, in_symbol INTEGER, name TEXT, lib INTEGER);
         CREATE INDEX extvar_name ON extvar(file_id, name, in_symbol);
@@ -711,7 +776,8 @@ fn link_calls(db: i64) {
                          AND (s.sig GLOB '*[( ]' || substr(text, 1, instr(text, '.') - 1) || ': ' || x.name || '[^A-Za-z0-9_]*'
                               OR s.sig GLOB '*[( ]' || substr(text, 1, instr(text, '.') - 1) || ': "' || x.name || '[^A-Za-z0-9_]*'
                               OR s.sig GLOB '*[( ]' || substr(text, 1, instr(text, '.') - 1) || ': Optional[[]' || x.name || '[^A-Za-z0-9_]*')));
-        INSERT OR IGNORE INTO done SELECT rowid FROM calls WHERE note = 'outside_object';
+        INSERT OR IGNORE INTO done SELECT rowid FROM calls WHERE note = 'outside_object'
+            /*dirty: AND rowid IN (SELECT cid FROM temp.dirty) */;
 
         -- The caller's file imports a file that defines the name. Weaker
         -- than the rules above (the import names the file, not this name),
@@ -736,7 +802,8 @@ fn link_calls(db: i64) {
                        AND b.in_symbol IN (calls.in_symbol, 0))
                OR EXISTS (SELECT 1 FROM symbols s WHERE s.id = calls.in_symbol
                           AND instr(COALESCE(s.params, ''), ',' || calls.callee || ',') > 0));
-        INSERT OR IGNORE INTO done SELECT rowid FROM calls WHERE note = 'local_value';
+        INSERT OR IGNORE INTO done SELECT rowid FROM calls WHERE note = 'local_value'
+            /*dirty: AND rowid IN (SELECT cid FROM temp.dirty) */;
 
         -- Not for `self.f()` / `this.f()`: when the caller's own type has no
         -- f here and no imported file does, f comes from a parent or a
@@ -745,7 +812,7 @@ fn link_calls(db: i64) {
         INSERT INTO chosen
             SELECT c.cid, c.sid, 'by_name' FROM cands c
             WHERE c.cid NOT IN (SELECT cid FROM done) AND c.n <= 8
-              AND c.cid NOT IN (SELECT k.rowid FROM calls k WHERE k.qual IN ('this', 'self', 'Self'));
+              AND c.cid NOT IN (SELECT k.rowid FROM calls k WHERE k.qual IN ('this', 'self', 'Self') /*dirty: AND k.rowid IN (SELECT cid FROM temp.dirty) */);
 
         INSERT INTO call_edges (caller, callee, file_id, row, weight, by_name, resolution)
             SELECT c.in_symbol, ch.sid, c.file_id, c.row,
@@ -754,24 +821,31 @@ fn link_calls(db: i64) {
 
         DROP TABLE defs; DROP TABLE ndefs; DROP TABLE cands; DROP TABLE chosen; DROP TABLE done;
         DROP TABLE pend; DROP TABLE prov; DROP TABLE roots; DROP TABLE ext; DROP TABLE asg; DROP TABLE extvar; DROP TABLE retdef;
-    """);
-    call_file_edges(db);
-}
+""";
 
-// File links from call links.
-fn call_file_edges(db: i64) {
-    sqlite::exec_or_die(db, """
+// File links from call links. With only_dirty (update), those out of the
+// files in temp.dirty_files, in place of the ones they had: a file's links
+// out hang on its own calls' links and, for a link by name, on how many
+// files define the name, and a name defined in more or fewer files than
+// before has had every call of it tied again.
+fn call_file_edges(db: i64, only_dirty: bool = false) {
+    sqlite::exec_or_die(db, open_marks("""
+        /*dirty: DELETE FROM file_edges WHERE kind = 'call' AND src IN (SELECT id FROM temp.dirty_files); */
         -- File links from calls count for less than an import: weight 0.3,
         -- and by_name links only for names defined in at most 3 files, so
         -- generic names (`new`, `parse`) don't tie unrelated files together.
+        -- (Summed smallest first: a sum of fractions hangs, in its last
+        -- digit, on the order they are added in, and the rows of a graph
+        -- update has touched are not in the order index writes them.)
         INSERT INTO file_edges (src, dst, kind, weight)
-            SELECT e.file_id, s.file_id, 'call', 0.3 * SUM(e.weight)
+            SELECT e.file_id, s.file_id, 'call', 0.3 * SUM(e.weight ORDER BY e.weight)
             FROM call_edges e JOIN symbols s ON s.id = e.callee
             WHERE s.file_id != e.file_id
+              /*dirty: AND e.file_id IN (SELECT id FROM temp.dirty_files) */
               AND (e.resolution != 'by_name'
                    OR (SELECT COUNT(DISTINCT d.file_id) FROM symbols d WHERE d.name = s.name AND d.kind IN ('function', 'class', 'struct', 'enum', 'trait', 'interface')) <= 3)
             GROUP BY e.file_id, s.file_id;
-    """);
+    """, "dirty", only_dirty));
 }
 
 // One level of Louvain's local moving on a graph in CSR form (off, nbr, w):
@@ -856,8 +930,26 @@ fn load_csr(db: i64, table: const u8[:], n: i64, off: i64[>..]&, nbr: i64[>..]&,
 // nothing moves. Deterministic: same repo, same communities.
 // gamma is Louvain's resolution: 1 is plain modularity; higher splits the
 // graph into more, smaller communities.
+//
+// A file's node number is its place in the walk (temp.ford), not its row
+// number: a graph update has added files to or taken files from has rows
+// out of that order and gaps between them, and the moves below go node by
+// node. In a graph straight from index the two are the same. A graph from
+// before stamps were kept has no places: its row numbers serve.
 fn communities(db: i64, gamma: f64) -> i64 {
     let n = scalar(db, "SELECT COUNT(*) FROM files");
+    sqlite::exec_or_die(db, "DROP TABLE IF EXISTS temp.ford; CREATE TEMP TABLE ford (id INTEGER PRIMARY KEY, ord INTEGER)");
+    if scalar(db, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'stamps'") == 1
+       && scalar(db, "SELECT COUNT(*) FROM stamps s JOIN files f ON f.id = s.file_id WHERE s.ord IS NOT NULL") == n {
+        sqlite::exec_or_die(db, "INSERT INTO temp.ford SELECT file_id, ROW_NUMBER() OVER (ORDER BY ord, file_id) - 1 FROM stamps WHERE file_id IN (SELECT id FROM files)");
+    } else {
+        sqlite::exec_or_die(db, "INSERT INTO temp.ford SELECT id, ROW_NUMBER() OVER (ORDER BY id) - 1 FROM files");
+    }
+    var ids: i64[>..] = [];   // node number -> file row
+    var ford_err: u8[>..] = [];
+    let ford_st = sqlite::prepare_or_die(db, "SELECT id FROM temp.ford ORDER BY ord");
+    while sqlite::step(ford_st, ford_err) == 1 { ids.push(sqlite::col_int(ford_st, 0)); }
+    sqlite::finalize(ford_st);
     // Tests are grouped with the code they exercise, not with each other:
     // communities come from the code files alone, and each test file then
     // joins the community it links to most.
@@ -868,14 +960,16 @@ fn communities(db: i64, gamma: f64) -> i64 {
             OR path GLOB '*/test_*.py' OR path GLOB 'test_*.py' OR path GLOB '*_test.py' OR path GLOB '*_tests.rs'
             OR path GLOB '*.test.[jt]s' OR path GLOB '*.test.[jt]sx' OR path GLOB '*.spec.[jt]s' OR path GLOB '*.spec.[jt]sx'
             OR path GLOB '*/conftest.py' OR path = 'conftest.py';
-        UPDATE files SET community = id - 1;
+        UPDATE files SET community = (SELECT o.ord FROM temp.ford o WHERE o.id = files.id);
         DROP TABLE IF EXISTS temp.g;
+        -- (Sums smallest first, here and below: see call_file_edges.)
         CREATE TEMP TABLE g AS
-            SELECT a - 1 AS a, b - 1 AS b, SUM(w) AS w FROM (
+            SELECT oa.ord AS a, ob.ord AS b, SUM(e.w ORDER BY e.w) AS w FROM (
                 SELECT src AS a, dst AS b, weight AS w FROM file_edges
-                UNION ALL SELECT dst, src, weight FROM file_edges)
-            WHERE a IN (SELECT id FROM files WHERE is_test = 0) AND b IN (SELECT id FROM files WHERE is_test = 0)
-            GROUP BY a, b;
+                UNION ALL SELECT dst, src, weight FROM file_edges) e
+            JOIN temp.ford oa ON oa.id = e.a JOIN temp.ford ob ON ob.id = e.b
+            WHERE e.a IN (SELECT id FROM files WHERE is_test = 0) AND e.b IN (SELECT id FROM files WHERE is_test = 0)
+            GROUP BY oa.ord, ob.ord;
     """);
     var member: i64[>..] = [];   // file index -> current community (a node of the current level)
     for i in 0..n { member.push(i); }
@@ -922,7 +1016,7 @@ fn communities(db: i64, gamma: f64) -> i64 {
     let up = sqlite::prepare_or_die(db, "UPDATE files SET community = ?2 WHERE id = ?1");
     for f in 0..n {
         sqlite::reset(up);
-        sqlite::bind_int(up, 1, f + 1);
+        sqlite::bind_int(up, 1, ids[f]);
         sqlite::bind_int(up, 2, member[f]);
         sqlite::step_done(up);
     }
@@ -932,7 +1026,7 @@ fn communities(db: i64, gamma: f64) -> i64 {
     // of unlinked tests.
     sqlite::exec_or_die(db, """
         CREATE TEMP TABLE test_votes AS
-            SELECT t.id AS tid, c.community AS cm, SUM(e.w) AS w FROM (
+            SELECT t.id AS tid, c.community AS cm, SUM(e.w ORDER BY e.w) AS w FROM (
                 SELECT src AS a, dst AS b, weight AS w FROM file_edges
                 UNION ALL SELECT dst, src, weight FROM file_edges) e
             JOIN files t ON t.id = e.a AND t.is_test = 1
@@ -957,12 +1051,13 @@ fn communities(db: i64, gamma: f64) -> i64 {
         INSERT INTO communities (id, label, size, tests)
             SELECT r.new, CASE WHEN r.old = -1 THEN 'tests linked to no code' ELSE (
                 SELECT f.path FROM files f
-                LEFT JOIN (SELECT dst AS id, SUM(weight) AS w FROM file_edges GROUP BY dst) i ON i.id = f.id
-                LEFT JOIN (SELECT src AS id, SUM(weight) AS w FROM file_edges GROUP BY src) o ON o.id = f.id
+                LEFT JOIN (SELECT dst AS id, SUM(weight ORDER BY weight) AS w FROM file_edges GROUP BY dst) i ON i.id = f.id
+                LEFT JOIN (SELECT src AS id, SUM(weight ORDER BY weight) AS w FROM file_edges GROUP BY src) o ON o.id = f.id
                 WHERE f.community = r.new
                 ORDER BY f.is_test, COALESCE(i.w, 0) + COALESCE(o.w, 0) DESC, f.path LIMIT 1) END, r.size, r.tests
             FROM ranked_c r;
         DROP TABLE ranked_c;
+        DROP TABLE temp.ford;
     """);
     return rounds;
 }

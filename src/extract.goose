@@ -156,19 +156,21 @@ extern fn sw_is_symlink(path: const u8[:]) -> bool;
 
 let LANGS = ["python", "typescript", "tsx", "javascript", "rust", "goose"];
 
-// Walks repo, parses every supported file and writes its facts. Returns
-// the number of files indexed.
-fn extract_repo(db: i64, repo: const u8[:]) -> i64 {
-    // Every file found: its absolute path and language, one per line each, and its row id.
-    var paths: u8[>..] = [];
-    var plangs: u8[>..] = [];
-    var pids: i64[>..] = [];
-    let ins_file = sqlite::prepare_or_die(db, "INSERT INTO files (path, lang, dir) VALUES (?1, ?2, ?3)");
+// (sw_mtime_ns: declared in compiler.goose.)
+extern fn sw_ctime_ns(path: const u8[:]) -> i64;
+extern fn sw_file_size(path: const u8[:]) -> i64;
+
+// The walk: every supported file below repo, as absolute paths and their
+// languages, one per line each, in the order index has always met them (a
+// folder's own files by name, then the folders found, in the order found).
+// Returns how many.
+fn walk_repo(repo: const u8[:], paths: u8[>..]&, plangs: u8[>..]&) -> i64 {
+    var count: i64 = 0;
     var dirs: u8[>..] = [];
     dirs.append(repo);
     dirs.push('\n');
     var next = 0;
-    while next < dirs.len && pids.len < 200000 {
+    while next < dirs.len && count < 200000 {
         let end = next + find(dirs[next..], "\n");
         var dir: u8[>..] = [];
         dir.append(dirs[next..end]);
@@ -186,59 +188,110 @@ fn extract_repo(db: i64, repo: const u8[:]) -> i64 {
                 // Goose has no tree-sitter grammar yet: goose_scan reads it by line.
                 let lang = if ends_with(full, ".goose") { "goose" } else { treesitter::language_of_path(full) };
                 if supported(lang) && !sw_is_symlink(full) {
-                    let rel = full[repo.len + 1..];
-                    let slash = rfind(rel, "/");
-                    sqlite::reset(ins_file);
-                    sqlite::bind_text(ins_file, 1, rel);
-                    sqlite::bind_text(ins_file, 2, lang);
-                    sqlite::bind_text(ins_file, 3, if slash >= 0 { rel[..slash] } else { "." });
-                    sqlite::step_done(ins_file);
-                    pids.push(sqlite::last_rowid(db));
                     paths.append(full);
                     paths.push('\n');
                     plangs.append(lang);
                     plangs.push('\n');
+                    count++;
                 }
             }
         };
     }
-    sqlite::finalize(ins_file);
-    let all_paths = split(paths, '\n');
-    let all_langs = split(plangs, '\n');
+    return count;
+}
 
-    // Every file goes to a pool of worker threads, one per hardware thread,
-    // taking files from one queue as they finish (a big file doesn't hold
-    // the rest up). A worker parses its file once and runs all of the
-    // language's patterns on that tree. Results come back as records and are
-    // written here, in file order, so the graph is the same every run.
-    for i in 0..pids.len {
+// A file's row. `rel` is its path below the repo.
+fn insert_file(db: i64, ins_file: i64, rel: const u8[:], lang: const u8[:]) -> i64 {
+    let slash = rfind(rel, "/");
+    sqlite::reset(ins_file);
+    sqlite::bind_text(ins_file, 1, rel);
+    sqlite::bind_text(ins_file, 2, lang);
+    sqlite::bind_text(ins_file, 3, if slash >= 0 { rel[..slash] } else { "." });
+    sqlite::step_done(ins_file);
+    return sqlite::last_rowid(db);
+}
+
+// Size and times of the first n files, taken before any of them is read:
+// a write that lands after its file was read then shows as a newer time.
+fn stat_files(all_paths: const u8[:][:], n: i64, sizes: i64[>..]&, mtimes: i64[>..]&, ctimes: i64[>..]&) {
+    for i in 0..n {
+        sizes.push(sw_file_size(all_paths[i]));
+        mtimes.push(sw_mtime_ns(all_paths[i]));
+        ctimes.push(sw_ctime_ns(all_paths[i]));
+    }
+}
+
+// A file's stamp, for `update` to compare with next time. `st` is
+// "INSERT OR REPLACE INTO stamps (file_id, ord, size, mtime, ctime, hash)".
+// A file written within three seconds of the run (`now`, ns) keeps no
+// times: file times move in steps of up to some milliseconds (two seconds
+// on some disks), so one more write in the same step would look unchanged.
+// With no times the next update reads the file and goes by its hash.
+fn put_stamp(st: i64, fid: i64, ord: i64, size: i64, mtime: i64, ctime: i64, hash: i64, now: i64) {
+    let settled = mtime > 0 && ctime > 0 && max(mtime, ctime) < now - 3000000000;
+    sqlite::reset(st);
+    sqlite::bind_int(st, 1, fid);
+    sqlite::bind_int(st, 2, ord);
+    sqlite::bind_int(st, 3, size);
+    sqlite::bind_int(st, 4, if settled { mtime } else { 0 });
+    sqlite::bind_int(st, 5, if settled { ctime } else { 0 });
+    sqlite::bind_int(st, 6, hash);
+    sqlite::step_done(st);
+}
+
+struct FileJob { idx: i64, lang: u8[..16], known: bool, old: i64, path: u8[>..] }
+struct FileDone { idx: i64, hash: i64, same: bool, data: u8[>..] }
+
+// Parses the files numbered in `which` (numbers into all_paths; n files in
+// all). Every file goes to a pool of worker threads, one per hardware
+// thread, taking files from one queue as they finish (a big file doesn't
+// hold the rest up). A worker parses its file once and runs all of the
+// language's patterns on that tree. Results come back as records: file i's
+// are all[at[i]..at[i] + len[i]], and hashes[i] is the hash of its content.
+// Where old_known[i] is set and the content still has the hash old_hash[i],
+// the file is not parsed and same[i] is 1.
+fn parse_files(all_paths: const u8[:][:], all_langs: const u8[:][:], n: i64, which: const i64[:],
+               old_known: const i64[:], old_hash: const i64[:],
+               all: u8[>..]&, at: i64[>..]&, len: i64[>..]&, hashes: i64[>..]&, same: i64[>..]&) {
+    at.resize(n, 0);
+    len.resize(n, 0);
+    hashes.resize(n, 0);
+    same.resize(n, 0);
+    guard which.len > 0;
+    for i in which {
         var job = FileJob { idx: i, .. };
         job.path.append(all_paths[i]);
         job.lang.append(all_langs[i]);
+        if i < old_known.len && old_known[i] != 0 {
+            job.known = true;
+            job.old = old_hash[i];
+        }
         qput(job);
     }
-    let workers = max(1, min(hardware_threads(), pids.len));
+    let workers = max(1, min(hardware_threads(), which.len));
     for w in 0..workers { qput(FileJob { idx: -1, .. }); }
     var tids: i64[>..] = [];
     for w in 0..workers { tids.push(thread_spawn(extract_worker)); }
-    var all: u8[>..] = [];
-    var at: i64[>..] = [];
-    var len: i64[>..] = [];
-    at.resize(pids.len, 0);
-    len.resize(pids.len, 0);
-    for k in 0..pids.len {
+    for k in 0..which.len {
         let d = qget<FileDone>();
         at[d.idx] = all.len;
         len[d.idx] = d.data.len;
+        hashes[d.idx] = d.hash;
+        if d.same { same[d.idx] = 1; }
         all.append(d.data);
     }
     for t in tids { thread_wait(t); }
+}
 
+// Writes the records of the files numbered in `which`, in that order, so
+// the graph is the same every run. pids[i] is file i's row.
+fn write_facts(db: i64, pids: const i64[:], all_langs: const u8[:][:], which: const i64[:],
+               all: const u8[:], at: const i64[:], len: const i64[:]) {
     let ins_sym = sqlite::prepare_or_die(db, "INSERT INTO symbols (file_id, name, kind, row, start, end_, end_row, sig, params) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)");
     let ins_imp = sqlite::prepare_or_die(db, "INSERT INTO imports (file_id, module, row, names) VALUES (?1, ?2, ?3, ?4)");
     let ins_call = sqlite::prepare_or_die(db, "INSERT INTO calls (file_id, row, start, callee, in_symbol, text, qual) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)");
     let ins_asg = sqlite::prepare_or_die(db, "INSERT INTO assigns (file_id, row, start, name, value, in_symbol) VALUES (?1, ?2, ?3, ?4, ?5, 0)");
-    for i in 0..pids.len {
+    for i in which {
         let fid = pids[i];
         // Records: kind 0x1f a 0x1f b 0x1f start 0x1f end 0x1f row 0x1e
         each_split(all[at[i]..at[i] + len[i]], 0x1e) { rec =>
@@ -296,48 +349,94 @@ fn extract_repo(db: i64, repo: const u8[:]) -> i64 {
     sqlite::finalize(ins_imp);
     sqlite::finalize(ins_call);
     sqlite::finalize(ins_asg);
-    // Two patterns can match one definition (a const arrow and a call can
-    // overlap): keep one row per place.
-    sqlite::exec_or_die(db, """
-        DELETE FROM symbols WHERE id NOT IN (
-            SELECT MIN(id) FROM symbols GROUP BY file_id, start, name);
-        -- A method's container: the class, struct, trait, interface, impl or
-        -- (TypeScript) object type it sits in. A function inside another
-        -- function is no method, whatever class is further out: the
-        -- innermost definition around it decides.
-        UPDATE symbols SET container = (
-            SELECT CASE WHEN c.kind = 'function' THEN NULL ELSE c.name END FROM symbols c
-            WHERE c.file_id = symbols.file_id AND c.id != symbols.id
-              AND c.kind IN ('class', 'struct', 'trait', 'interface', 'impl', 'type', 'function')
-              AND c.start <= symbols.start AND symbols.end_ <= c.end_
-            ORDER BY c.end_ - c.start LIMIT 1)
-        WHERE kind = 'function';
-        -- A call site sits in the innermost definition that spans it.
-        UPDATE calls SET in_symbol = COALESCE((
-            SELECT s.id FROM symbols s
-            WHERE s.file_id = calls.file_id AND s.start <= calls.start AND calls.start < s.end_
-              AND s.kind IN ('function', 'impl')
-            ORDER BY s.end_ - s.start LIMIT 1), 0);
-        -- A binding whose value was read (`x = f()`) is also matched by the
-        -- catch-all pattern; the unknown-value twin goes.
-        DELETE FROM assigns WHERE value = '?' AND EXISTS (
-            SELECT 1 FROM assigns b WHERE b.file_id = assigns.file_id AND b.name = assigns.name
-              AND b.start = assigns.start AND b.value <> '?');
-        UPDATE assigns SET in_symbol = COALESCE((
-            SELECT s.id FROM symbols s
-            WHERE s.file_id = assigns.file_id AND s.start <= assigns.start AND assigns.start < s.end_
-              AND s.kind IN ('function', 'impl')
-            ORDER BY s.end_ - s.start LIMIT 1), 0);
-        -- A definition's own text also matches the call pattern in some
-        -- grammars; a call at a definition's exact start is not one.
-        DELETE FROM calls WHERE EXISTS (
-            SELECT 1 FROM symbols s WHERE s.file_id = calls.file_id AND s.start = calls.start);
-    """);
-    return pids.len;
 }
 
-struct FileJob { idx: i64, lang: u8[..16], path: u8[>..] }
-struct FileDone { idx: i64, data: u8[>..] }
+// What the records of a file need once they are all written. Each
+// statement looks only within one file, so `update` runs them for the
+// files it read again (temp.u_changed) and index for every file.
+let SETTLE_SQL = """
+    -- Two patterns can match one definition (a const arrow and a call can
+    -- overlap): keep one row per place.
+    DELETE FROM symbols WHERE id NOT IN (
+        SELECT MIN(id) FROM symbols /*only: WHERE file_id IN (SELECT id FROM temp.u_changed) */
+        GROUP BY file_id, start, name)
+        /*only: AND file_id IN (SELECT id FROM temp.u_changed) */;
+    -- A method's container: the class, struct, trait, interface, impl or
+    -- (TypeScript) object type it sits in. A function inside another
+    -- function is no method, whatever class is further out: the
+    -- innermost definition around it decides.
+    UPDATE symbols SET container = (
+        SELECT CASE WHEN c.kind = 'function' THEN NULL ELSE c.name END FROM symbols c
+        WHERE c.file_id = symbols.file_id AND c.id != symbols.id
+          AND c.kind IN ('class', 'struct', 'trait', 'interface', 'impl', 'type', 'function')
+          AND c.start <= symbols.start AND symbols.end_ <= c.end_
+        ORDER BY c.end_ - c.start LIMIT 1)
+    WHERE kind = 'function' /*only: AND file_id IN (SELECT id FROM temp.u_changed) */;
+    -- A call site sits in the innermost definition that spans it.
+    UPDATE calls SET in_symbol = COALESCE((
+        SELECT s.id FROM symbols s
+        WHERE s.file_id = calls.file_id AND s.start <= calls.start AND calls.start < s.end_
+          AND s.kind IN ('function', 'impl')
+        ORDER BY s.end_ - s.start LIMIT 1), 0)
+        /*only: WHERE file_id IN (SELECT id FROM temp.u_changed) */;
+    -- A binding whose value was read (`x = f()`) is also matched by the
+    -- catch-all pattern; the unknown-value twin goes.
+    DELETE FROM assigns WHERE value = '?' AND EXISTS (
+        SELECT 1 FROM assigns b WHERE b.file_id = assigns.file_id AND b.name = assigns.name
+          AND b.start = assigns.start AND b.value <> '?')
+        /*only: AND file_id IN (SELECT id FROM temp.u_changed) */;
+    UPDATE assigns SET in_symbol = COALESCE((
+        SELECT s.id FROM symbols s
+        WHERE s.file_id = assigns.file_id AND s.start <= assigns.start AND assigns.start < s.end_
+          AND s.kind IN ('function', 'impl')
+        ORDER BY s.end_ - s.start LIMIT 1), 0)
+        /*only: WHERE file_id IN (SELECT id FROM temp.u_changed) */;
+    -- A definition's own text also matches the call pattern in some
+    -- grammars; a call at a definition's exact start is not one.
+    DELETE FROM calls WHERE EXISTS (
+        SELECT 1 FROM symbols s WHERE s.file_id = calls.file_id AND s.start = calls.start)
+        /*only: AND file_id IN (SELECT id FROM temp.u_changed) */;
+""";
+
+fn settle_facts(db: i64, only_changed: bool) {
+    sqlite::exec_or_die(db, open_marks(SETTLE_SQL, "only", only_changed));
+}
+
+// Walks repo, parses every supported file and writes its facts and its
+// stamp. Returns the number of files indexed.
+fn extract_repo(db: i64, repo: const u8[:]) -> i64 {
+    let now = time_ns();
+    var paths: u8[>..] = [];
+    var plangs: u8[>..] = [];
+    let n = walk_repo(repo, paths, plangs);
+    let all_paths = split(paths, '\n');
+    let all_langs = split(plangs, '\n');
+    var pids: i64[>..] = [];
+    let ins_file = sqlite::prepare_or_die(db, "INSERT INTO files (path, lang, dir) VALUES (?1, ?2, ?3)");
+    for i in 0..n { pids.push(insert_file(db, ins_file, all_paths[i][repo.len + 1..], all_langs[i])); }
+    sqlite::finalize(ins_file);
+    var sizes: i64[>..] = [];
+    var mtimes: i64[>..] = [];
+    var ctimes: i64[>..] = [];
+    stat_files(all_paths, n, sizes, mtimes, ctimes);
+
+    var which: i64[>..] = [];
+    for i in 0..n { which.push(i); }
+    var none: i64[>..] = [];
+    var all: u8[>..] = [];
+    var at: i64[>..] = [];
+    var len: i64[>..] = [];
+    var hashes: i64[>..] = [];
+    var same: i64[>..] = [];
+    parse_files(all_paths, all_langs, n, which, none, none, all, at, len, hashes, same);
+    write_facts(db, pids, all_langs, which, all, at, len);
+    settle_facts(db, false);
+
+    let ins_stamp = sqlite::prepare_or_die(db, "INSERT OR REPLACE INTO stamps (file_id, ord, size, mtime, ctime, hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6)");
+    for i in 0..n { put_stamp(ins_stamp, pids[i], i, sizes[i], mtimes[i], ctimes[i], hashes[i], now); }
+    sqlite::finalize(ins_stamp);
+    return n;
+}
 
 fn record(out: u8[>..]&, kind: const u8[:], a: const u8[:], b: const u8[:], start: i64, end: i64, row: i64) {
     format(out, kind, "\x1f", a, "\x1f", b, "\x1f", start, "\x1f", end, "\x1f", row);
@@ -519,12 +618,21 @@ thread_fn extract_worker() {
         guard job.idx >= 0 else { break; }
         var done = FileDone { idx: job.idx, .. };
         var text: u8[>..] = [];
-        if job.lang == "goose" {
-            if read_file(job.path, text) { goose_scan(text, done.data); }
+        let have = read_file(job.path, text);
+        // (A file that cannot be read has the hash 0 and no facts.)
+        if have { done.hash = hash(text) as! i64; }
+        // update: the content index saw last time; nothing to read again.
+        if job.known && job.old == done.hash {
+            done.same = true;
             qput(done);
             continue;
         }
-        if read_file(job.path, text) {
+        if job.lang == "goose" {
+            if have { goose_scan(text, done.data); }
+            qput(done);
+            continue;
+        }
+        if have {
             treesitter::t_text.clear();
             treesitter::t_text.append(text);
             if treesitter::parse(job.lang, treesitter::t_text, treesitter::t_nodes) {

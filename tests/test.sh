@@ -314,6 +314,143 @@ mkdir "$work/survey/node_modules"
 check "survey: with node_modules at the workspace root, its packages' dependencies are installed there" "$(SV); assert P[('packages/web', 'node')]['dependencies_installed'] == {'installed': True, 'at': 'node_modules'}, P[('packages/web', 'node')]"
 check "survey: says nothing was run, and a path that is no folder is an error" "$(SV); import subprocess; assert 'nothing of the repo was run' in d['evidence']; r=subprocess.run(['$SW','survey','$work/survey/package.json'],capture_output=True,text=True); assert r.returncode != 0"
 
+# update (2026-11-18): the graph it leaves is the one index builds from the
+# same files. A repo made of the fixtures (mini at the top; kinds, rules,
+# esm, goose, nested and outside below more/; and more/ext, where a module
+# is imported that the repo does not hold), then one change at a time.
+# After each, tests/graph_dump.py (a graph without its row numbers) must
+# print the same for the updated graph and for a fresh one.
+up="$work/up"; ug="$work/up.db"
+mkdir -p "$up/more/ext"; cp -r tests/fixtures/mini/. "$up/"
+for x in kinds rules esm goose nested outside; do cp -r "tests/fixtures/$x" "$up/more/$x"; done
+printf 'import gadgets\n\n\ndef go():\n    return gadgets.build(1)\n' > "$up/more/ext/use.py"
+printf 'def build(x):\n    return x\n' > "$up/more/ext/make.py"
+sleep 4   # a file written in the last three seconds is read again whatever its times say: let them settle
+"$SW" index "$up" "$ug" >/dev/null
+dump() { python3 tests/graph_dump.py --ord "$1"; }
+as_index_of() { "$SW" index "$1" "$work/ref.db" >/dev/null && { [ "$(dump "$2")" = "$(dump "$work/ref.db")" ] && echo same || echo different; }; }
+as_index() { as_index_of "$up" "$ug"; }
+U() { "$SW" update "$up" "$ug" > "$work/u.json" 2>"$work/u.err"; echo "import json; d=json.load(open('$work/u.json'))"; }
+top_line() { printf '%s\n' "$2" | cat - "$up/$1" > "$work/t" && cp "$work/t" "$up/$1"; }
+
+check "update: nothing changed: no file is read, no call is tied again" "$(U); assert d['built_whole'] is False and d['files'] > 20 and d['looked_at'] == 0 and d['changed'] == [] and d['calls_tied_again'] == 0, d"
+eq "update: ... and the graph is as index left it" "$(as_index)" same
+
+top_line app/models.py '# a note'
+eq "graph_dump: a graph from before a change is not the one index builds after it" "$(as_index)" different
+check "update: a line added above a file's functions: the file is read again, and only its own calls are tied again" "$(U); assert d['changed'] == ['app/models.py'] and d['added'] == [] and d['removed'] == [] and d['files_with_calls_tied_again'] == ['app/models.py'] and 0 < d['calls_tied_again'] < d['calls'], d"
+eq "update: ... the call into it from another file keeps its link, now to the function's new row" "$(q "$ug" "select group_concat(e.resolution || '>' || s.name || '@' || s.row, ' ') from call_edges e join symbols s on s.id = e.callee join files f on f.id = e.file_id where f.path = 'app/main.py' and s.name = 'total_area'")" "imported_name>total_area@7"
+eq "update: ... and the graph is the one index builds" "$(as_index)" same
+
+top_line app/main.py '# a note'
+check "update: a file with imports read again: only that file" "$(U); assert d['changed'] == ['app/main.py'] and d['files_with_calls_tied_again'] == ['app/main.py'], d"
+eq "update: ... each of its two imports is tied once" "$(q "$ug" "select count(*) from file_edges e join files f on f.id = e.src where f.path = 'app/main.py' and e.kind = 'import'")" 2
+eq "update: ... and the graph is the one index builds" "$(as_index)" same
+
+sed -i 's/def total_area/def total_size/' "$up/app/models.py"
+check "update: a function renamed: the calls of its old name in other files are tied again" "$(U); assert d['changed'] == ['app/models.py'] and {'app/main.py', 'tests/test_models.py'} <= set(d['files_with_calls_tied_again']), d"
+eq "update: ... and have no link left" "$(q "$ug" "select count(*) from call_edges e join calls c on c.file_id = e.file_id and c.row = e.row join files f on f.id = e.file_id where f.path = 'app/main.py' and c.callee = 'total_area'")" 0
+eq "update: ... and the graph is the one index builds" "$(as_index)" same
+
+printf 'def total_area(shapes):\n    return 0\n' > "$up/app/areas.py"
+check "update: a file added: listed, and the calls of a name it defines are tied again" "$(U); assert d['added'] == ['app/areas.py'] and d['changed'] == [] and 'app/main.py' in d['files_with_calls_tied_again'], d"
+eq "update: ... to it" "$(q "$ug" "select group_concat(e.resolution || '>' || g.path, ' ') from call_edges e join symbols s on s.id = e.callee join files g on g.id = s.file_id join files f on f.id = e.file_id where f.path = 'app/main.py' and s.name = 'total_area'")" "by_name>app/areas.py"
+eq "update: ... and the graph is the one index builds" "$(as_index)" same
+
+mv "$up/web/store.ts" "$up/web/stores.ts"
+check "update: a file renamed is one removed and one added, and the file that imported it is tied again" "$(U); assert d['removed'] == ['web/store.ts'] and d['added'] == ['web/stores.ts'] and 'web/index.ts' in d['files_with_calls_tied_again'], d"
+eq "update: ... and the graph is the one index builds" "$(as_index)" same
+
+rm "$up/app/util.py"
+check "update: a file removed: listed" "$(U); assert d['removed'] == ['app/util.py'] and d['added'] == [] and d['changed'] == [], d"
+eq "update: ... and the graph is the one index builds" "$(as_index)" same
+
+for f in more/kinds/core/src/lib.rs more/kinds/web/shapes.ts more/goose/main.goose more/esm/main.js more/rules/app.py more/nested/python/mypkg/core.py; do
+  if [ -f "$up/$f" ]; then
+    top_line "$f" ''
+    "$SW" update "$up" "$ug" >/dev/null 2>&1
+    eq "update: a line added at the top of $f: the graph index builds" "$(as_index)" same
+    sed -i '4,7d' "$up/$f"
+    "$SW" update "$up" "$ug" >/dev/null 2>&1
+    eq "update: lines 4 to 7 of $f taken out: the graph index builds" "$(as_index)" same
+  else
+    bad "update: the fixture file $f is not there"
+  fi
+done
+
+eq "update: a call through a module the repo does not hold is a call out of the repo" "$(q "$ug" "select coalesce(c.note, 'no note') from calls c join files f on f.id = c.file_id where f.path = 'more/ext/use.py' and c.callee = 'build'")" external
+mkdir "$up/gadgets"; echo 'export const a = 1;' > "$up/gadgets/x.ts"
+check "update: a new folder at the top makes its name the repo's own: every call is tied again" "$(U); assert d['added'] == ['gadgets/x.ts'] and d['all_calls_tied_again'] is True and d['calls_tied_again'] == d['calls'], d"
+eq "update: ... and gadgets.build() is no longer a call out of the repo" "$(q "$ug" "select coalesce(c.note, 'no note') from calls c join files f on f.id = c.file_id where f.path = 'more/ext/use.py' and c.callee = 'build'")" "no note"
+eq "update: ... and the graph is the one index builds" "$(as_index)" same
+
+touch "$up/app/main.py"
+check "update: a file touched and not changed is looked at and left alone" "$(U); assert d['looked_at'] >= 1 and d['changed'] == [] and d['calls_tied_again'] == 0, d"
+
+touch -r "$up/more/ext/make.py" "$work/was"
+printf 'def built(x):\n    return x\n' > "$up/more/ext/make.py"
+touch -r "$work/was" "$up/more/ext/make.py"
+check "update: a file changed and given back its size and its old time is still seen" "$(U); assert d['changed'] == ['more/ext/make.py'], d"
+eq "update: ... and the graph is the one index builds" "$(as_index)" same
+
+sleep 4
+"$SW" update "$up" "$ug" >/dev/null
+check "update: once file times have settled, an unchanged repo costs no read" "$(U); assert d['looked_at'] == 0 and d['changed'] == [], d"
+
+"$SW" update "$up" "$ug" --resolution 3 >/dev/null
+"$SW" index "$up" "$work/ref3.db" --resolution 3 >/dev/null
+eq "update: --resolution groups the files again, as index does at that resolution" "$([ "$(dump "$ug")" = "$(dump "$work/ref3.db")" ] && echo same || echo different) $(q "$ug" "select value from meta where key = 'resolution'")" "same 300"
+
+check "update: no graph there: it is built whole, and the answer says so" "import json,subprocess; d=json.loads(subprocess.check_output(['$SW','update','$up','$work/none.db','--resolution','3'])); assert d['built_whole'] is True and 'no graph' in d['why'] and 'files' in d['index'], d"
+eq "update: ... the same graph" "$([ "$(dump "$work/none.db")" = "$(dump "$work/ref3.db")" ] && echo same || echo different)" same
+cp "$ug" "$work/norules.db"; q "$work/norules.db" "delete from meta where key = 'rules'"
+check "update: a graph from before rules were numbered is built whole" "import json,subprocess; d=json.loads(subprocess.check_output(['$SW','update','$up','$work/norules.db'])); assert d['built_whole'] is True and 'other rules' in d['why'], d"
+cp "$work/kindsc.db" "$work/upc.db"
+check "update: a graph holding compiler answers is built whole, and the answer says to run compiler again" "import json,subprocess; d=json.loads(subprocess.check_output(['$SW','update','tests/fixtures/kinds','$work/upc.db'])); assert d['built_whole'] is True and 'compiler' in d['why'], d"
+check "update: a graph of another folder is built whole for this one" "import json,subprocess; d=json.loads(subprocess.check_output(['$SW','update','tests/fixtures/mini','$work/upc.db'])); assert d['built_whole'] is True and 'was of' in d['why'], d"
+check "update: a folder that is not there is an error" "import subprocess; r=subprocess.run(['$SW','update','$work/nowhere','$work/upc.db'],capture_output=True,text=True); assert r.returncode != 0 and 'no such directory' in r.stderr, r.stderr"
+
+# A name defined in more than 50 places is tied only within the caller's
+# own file and the files it imports, so update redoes a change to one only
+# in the files that import the changed file; at 50 or fewer, everywhere.
+# 59 files that define run(), one (m00) that does not yet, a file that
+# imports run from m00 and calls it, and one that calls run() with no import.
+# (Each run() makes a call of its own, so that the calls of run are few
+# among all: past two calls in five, update ties them all.)
+cm="$work/common"; cg="$work/common.db"; mkdir -p "$cm/c"
+for i in $(seq -w 1 59); do printf 'def run(x):\n    return len(x)\n' > "$cm/c/m$i.py"; done
+printf 'def other(x):\n    return x\n' > "$cm/c/m00.py"
+printf 'from c.m00 import run\n\n\ndef go():\n    return run(1)\n' > "$cm/c/user.py"
+printf 'def go2():\n    return run(2)\n' > "$cm/c/loose.py"
+"$SW" index "$cm" "$cg" >/dev/null
+run_links() { q "$cg" "select coalesce((select group_concat(e.resolution || '>' || g.path, ' ') from call_edges e join symbols s on s.id = e.callee join files g on g.id = s.file_id where e.file_id = f.id), 'unlinked') from files f where f.path = '$1'"; }
+UC() { "$SW" update "$cm" "$cg" > "$work/u.json" 2>"$work/u.err"; echo "import json; d=json.load(open('$work/u.json'))"; }
+eq "update: a name defined in 59 places: the call of it through an import of a file that does not define it has no link" "$(run_links c/user.py)" unlinked
+printf 'def other(x):\n    return x\n\n\ndef run(x):\n    return x\n' > "$cm/c/m00.py"
+check "update: a 60th definition, in the imported file: the calls are tied again in that file and in the file that imports it, and nowhere else" "$(UC); assert d['changed'] == ['c/m00.py'] and d['files_with_calls_tied_again'] == ['c/m00.py', 'c/user.py'], d"
+eq "update: ... and the importing file's call has its link" "$(run_links c/user.py)" "imported_name>c/m00.py"
+eq "update: ... and the graph is the one index builds" "$(as_index_of "$cm" "$cg")" same
+rm "$cm"/c/m5?.py
+check "update: ten of the definitions removed, 50 left: every call of the name is tied again, wherever it is" "$(UC); assert len(d['removed']) == 10 and {'c/user.py', 'c/loose.py'} <= set(d['files_with_calls_tied_again']), d"
+eq "update: ... and the graph is the one index builds" "$(as_index_of "$cm" "$cg")" same
+
+# Past two calls in five, update ties every call again, as index does: the
+# same links, sooner than tying a long list one statement at a time.
+fw="$work/few"; fg="$work/few.db"; mkdir -p "$fw"
+printf 'def a(x):\n    return b(x)\n\n\ndef b(x):\n    return len(x)\n' > "$fw/one.py"
+printf 'def c(x):\n    return str(x)\n' > "$fw/two.py"
+"$SW" index "$fw" "$fg" >/dev/null
+printf '# a note\ndef a(x):\n    return b(x)\n\n\ndef b(x):\n    return len(x)\n' > "$fw/one.py"
+check "update: a change that reaches most of the calls: all of them are tied again, and the answer says so" "import json,subprocess; d=json.loads(subprocess.check_output(['$SW','update','$fw','$fg'])); assert d['changed'] == ['one.py'] and d['all_calls_tied_again'] is True and d['calls_tied_again'] == d['calls'] == 3, d"
+eq "update: ... and the graph is the one index builds" "$(as_index_of "$fw" "$fg")" same
+
+# What index writes for a repo carries a number (RULES_NUMBER): update
+# builds a graph whole when it was written under another. The fixtures'
+# graphs are held to it here, so a change to a reader, a pattern or a link
+# rule that alters them cannot go in with the number as it was.
+rules_hash() { for x in mini kinds rules esm goose nested outside; do "$SW" index "tests/fixtures/$x" "$work/rh.db" >/dev/null; python3 tests/graph_dump.py "$work/rh.db"; done | sha256sum | cut -c1-16; }
+eq "rules: the fixtures' graphs are those of this rules number (a reader, pattern or link rule changed them: raise RULES_NUMBER in src/store.goose and put '<number>:<hash>' here; only a fixture changed: the hash)" "$(sed -n 's/^let RULES_NUMBER = "\(.*\)";/\1/p' src/store.goose):$(rules_hash)" "1:8823e4165eb7e8c3"
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

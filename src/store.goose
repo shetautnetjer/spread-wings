@@ -32,6 +32,12 @@ CREATE TABLE IF NOT EXISTS call_edges (
 CREATE TABLE IF NOT EXISTS decisions (
     file_id INTEGER, row INTEGER, callee TEXT, choice TEXT, target INTEGER, p INTEGER);
 CREATE TABLE IF NOT EXISTS communities (id INTEGER PRIMARY KEY, label TEXT, size INTEGER, tests INTEGER);
+-- What index last saw of each file, for `update`: its place in the walk
+-- (0 for the first file), and its size, times and a hash of its content.
+-- mtime and ctime are 0 when the file was written so close to the run that
+-- a later write could carry the same times: such a file is read again.
+CREATE TABLE IF NOT EXISTS stamps (
+    file_id INTEGER PRIMARY KEY, ord INTEGER, size INTEGER, mtime INTEGER, ctime INTEGER, hash INTEGER);
 CREATE INDEX IF NOT EXISTS symbols_name ON symbols(name);
 CREATE INDEX IF NOT EXISTS symbols_file ON symbols(file_id);
 CREATE INDEX IF NOT EXISTS calls_callee ON calls(callee);
@@ -59,6 +65,36 @@ fn open_fresh(path: const u8[:]) -> i64 {
 // not read: indexing takes seconds, and a command that met a missing column
 // used to stop with a raw SQL error.
 let SCHEMA_NUMBER = "8";
+
+// The number of what index writes for a given repo: the readers, the
+// patterns and the link rules. It goes up whenever a change to any of them
+// gives some repo another graph. `update` redoes only what a changed file
+// reaches, so a graph it left half under the old rules and half under the
+// new would be neither: a graph written under another number is rebuilt
+// whole. (tests/test.sh holds the fixtures' graphs to this number: when
+// they change and it has not, a check fails and says to raise it.)
+let RULES_NUMBER = "1";
+
+// `/*tag: text */` in a script is a comment, and the script covers the whole
+// graph (index). With `on`, each one is opened up into its text, which
+// narrows the statement it sits in to the rows update is redoing.
+fn open_marks(sql: const u8[:], tag: const u8[:], on: bool) -> u8[>..] {
+    var out: u8[>..] = [];
+    guard on else { out.append(sql); return out; }
+    let open = str("/*", tag, ":");
+    var at = 0;
+    loop {
+        let a = find(sql[at..], open);
+        guard a >= 0 else { break; }
+        out.append(sql[at..at + a]);
+        let b = find(sql[at + a..], "*/");
+        guard b >= 0 else { abort(str("spread-wings: an unclosed /*", tag, ": in a script")); }
+        out.append(sql[at + a + open.len..at + a + b]);
+        at = at + a + b + 2;
+    }
+    out.append(sql[at..]);
+    return out;
+}
 
 fn open_map(path: const u8[:]) -> i64 {
     var err: u8[>..] = [];
