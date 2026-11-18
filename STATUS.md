@@ -24,3 +24,18 @@ from its answers, small windowed states, rules for outside-repo calls (about $0.
 first run on Graphify's repo, answers cached by content).
 
 Not done: more languages, incremental re-indexing.
+
+## 2026-11-17: Goose
+
+Spread-Wings reads Goose (`.goose`), the language it and Swan are written
+in. There is no tree-sitter grammar for Goose, so `goose_scan`
+(src/extract.goose) reads it by line: comments and strings (`"""` blocks
+too) blanked, then `fn`/`thread_fn`/`extern fn`/`struct`/`enum`/top-level
+`let`, `import .x;` (x.goose beside the importer) and bare calls.
+
+- On Swan's own repo: 43 Goose files, 461 functions, each matching an
+  independent count by name and line; indexed with the rest in 0.15 s.
+- tests/fixtures/goose and three checks; 52 pass.
+- Limit: a call into a file the caller does not import directly stays
+  by_name (1,647 of 4,059 linked Goose calls on Swan), though a Goose
+  program is one namespace.

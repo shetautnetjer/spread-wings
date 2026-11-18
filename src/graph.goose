@@ -129,6 +129,15 @@ fn import_candidates(lang: const u8[:], importer: const u8[:], module: const u8[
         }
         return;
     }
+    if lang == "goose" {
+        // `import .x;` and `import .a.b;` are x.goose and a/b.goose beside the
+        // importer. No leading dot: the standard library or a fetched package.
+        guard module.len > 1 && module[0] == '.' else { return; }
+        var rel: u8[>..] = [];
+        for c in module[1..] { rel.push(if c == '.' { '/' } else { c }); }
+        if dir.len > 0 { format(out, dir, "/", rel, ".goose\n"); } else { format(out, rel, ".goose\n"); }
+        return;
+    }
     if lang == "rust" {
         // crate::a::b, self::a, super::a: the module files a.rs, a/mod.rs,
         // a/b.rs near the importer's crate root (the folder holding src/).

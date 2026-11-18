@@ -14,7 +14,8 @@ let SKIP_DIRS = ["node_modules", ".git", "target", ".venv", "venv", "__pycache__
 
 // The languages v0.1 extracts, as goose-treesitter names them.
 fn supported(lang: const u8[:]) -> bool {
-    return lang == "python" || lang == "typescript" || lang == "tsx" || lang == "javascript" || lang == "rust";
+    return lang == "python" || lang == "typescript" || lang == "tsx" || lang == "javascript" || lang == "rust" ||
+           lang == "goose";
 }
 
 // "kind<TAB>capture<TAB>pattern" per line. kind "import" captures the
@@ -156,7 +157,7 @@ struct Def { file: i64, start: i64, end: i64, id: i64 }
 
 extern fn sw_is_symlink(path: const u8[:]) -> bool;
 
-let LANGS = ["python", "typescript", "tsx", "javascript", "rust"];
+let LANGS = ["python", "typescript", "tsx", "javascript", "rust", "goose"];
 
 // Walks repo, parses every supported file and writes its facts. Returns
 // the number of files indexed.
@@ -185,7 +186,8 @@ fn extract_repo(db: i64, repo: const u8[:]) -> i64 {
                 // Hidden folders (.git, .tools, .github, .cache) hold tooling, not the code.
                 if name[0] != '.' && !contains(SKIP_DIRS, name) && !sw_is_symlink(full) { dirs.append(full); dirs.push('\n'); }
             } else {
-                let lang = treesitter::language_of_path(full);
+                // Goose has no tree-sitter grammar yet: goose_scan reads it by line.
+                let lang = if ends_with(full, ".goose") { "goose" } else { treesitter::language_of_path(full) };
                 if supported(lang) && !sw_is_symlink(full) {
                     let rel = full[repo.len + 1..];
                     let slash = rfind(rel, "/");
@@ -385,12 +387,137 @@ fn import_names(raw: const u8[:], out: u8[>..]&) {
     };
 }
 
+// Goose (github.com/aardappel/goose) by line, since goose-treesitter has no
+// grammar for it: definitions (`fn`, `thread_fn`, `extern fn`, `struct`,
+// `enum`, top-level `let`/`var`), imports (`import .x;` is x.goose beside the
+// importer; anything else is the standard library or a package) and calls
+// (a bare name before `(`; `a::b(` and `x.m(` are packages and methods).
+// Comments and strings, `"""` blocks included, are blanked first. A
+// definition ends at the closing brace on its own indentation.
+let GOOSE_WORDS = ["if", "else", "while", "for", "loop", "guard", "return", "match", "fn", "thread_fn", "let", "var",
+                   "in", "as", "struct", "enum", "import", "extern", "break", "continue", "and", "or", "not"];
+
+fn goose_scan(text: const u8[:], out: u8[>..]&) {
+    // code: text with comments and string contents turned to spaces, newlines kept.
+    var code: u8[>..] = [];
+    var i = 0;
+    var in_raw = false;
+    var in_str = false;
+    while i < text.len {
+        let c = text[i];
+        if in_raw {
+            if c == '"' && i + 2 < text.len && text[i + 1] == '"' && text[i + 2] == '"' { in_raw = false; code.append("   "); i += 3; continue; }
+            code.push(if c == '\n' { '\n' } else { ' ' });
+        } else if in_str {
+            if c == '\\' && i + 1 < text.len { code.append("  "); i += 2; continue; }
+            if c == '"' || c == '\n' { in_str = false; }
+            code.push(if c == '\n' { '\n' } else { ' ' });
+        } else if c == '"' && i + 2 < text.len && text[i + 1] == '"' && text[i + 2] == '"' {
+            in_raw = true; code.append("   "); i += 3; continue;
+        } else if c == '"' {
+            in_str = true; code.push(' ');
+        } else if c == '\'' && i + 2 < text.len && (text[i + 2] == '\'' || (text[i + 1] == '\\' && i + 3 < text.len && text[i + 3] == '\'')) {
+            let n = if text[i + 2] == '\'' { 3 } else { 4 };
+            for k in 0..n { code.push(' '); }
+            i += n; continue;
+        } else if c == '/' && i + 1 < text.len && text[i + 1] == '/' {
+            while i < text.len && text[i] != '\n' { code.push(' '); i++; }
+            continue;
+        } else {
+            code.push(c);
+        }
+        i++;
+    }
+    // Line starts, for rows and for finding where a definition ends.
+    var starts: i64[>..] = [];
+    starts.push(0);
+    for k in 0..code.len { if code[k] == '\n' { starts.push(k + 1); } }
+    fn indent_of(l: const u8[:]) -> i64 { var n = 0; while n < l.len && l[n] == ' ' { n++; } return n; }
+    for r in 0..starts.len {
+        let ls = starts[r];
+        let le = if r + 1 < starts.len { starts[r + 1] - 1 } else { code.len };
+        guard le > ls else { continue; }
+        let line = code[ls..le];
+        let ind = indent_of(line);
+        let t = line[ind..];
+        // Imports: the original text holds the package string, the code the name.
+        if ind == 0 && starts_with(t, "import ") {
+            let semi = find(t, ";");
+            let body = trim(if semi > 0 { t[7..semi] } else { t[7..] });
+            let sp = find(body, " ");
+            let m = if sp > 0 { body[..sp] } else { body };
+            if m.len > 0 { record(out, "import", m, "", ls, le, r + 1); }
+            continue;
+        }
+        // Definitions.
+        var kind: const u8[:] = "";
+        var skip = -1;
+        if starts_with(t, "fn ") { kind = "function"; skip = 3; }
+        else if starts_with(t, "thread_fn ") { kind = "function"; skip = 10; }
+        else if starts_with(t, "extern ") && find(t, "fn ") > 0 { kind = "function"; skip = find(t, "fn ") + 3; }
+        else if starts_with(t, "struct ") { kind = "struct"; skip = 7; }
+        else if starts_with(t, "enum ") { kind = "enum"; skip = 5; }
+        else if ind == 0 && (starts_with(t, "let ") || starts_with(t, "var ")) { kind = "variable"; skip = 4; }
+        let rest = if skip >= 0 { t[skip..] } else { t[..0] };
+        var def_name_end = 0;
+        if kind.len > 0 {
+            var n = 0;
+            while n < rest.len && ident_char(rest[n]) { n++; }
+            if n > 0 {
+                let name_at = ls + (line.len - rest.len);
+                def_name_end = name_at + n - ls;
+                // Ends on this line (a one-liner, an extern, a let), or at the
+                // first later line that is `}` at this indentation.
+                var end_row = r;
+                let opens = find(t, "{") >= 0 && rfind(t, "}") < rfind(t, "{");
+                if opens {
+                    var q = r + 1;
+                    while q < starts.len {
+                        let qs = starts[q];
+                        let qe = if q + 1 < starts.len { starts[q + 1] - 1 } else { code.len };
+                        let ql = code[qs..max(qs, qe)];
+                        if indent_of(ql) == ind && ql.len > ind && ql[ind] == '}' { end_row = q; break; }
+                        q++;
+                    }
+                }
+                let end_at = if end_row + 1 < starts.len { starts[end_row + 1] - 1 } else { code.len };
+                var sig: u8[>..] = [];
+                let brace = find(text[ls..le], "{");
+                sig.append(trim(if brace > 0 && kind != "variable" { text[ls..ls + brace] } else { text[ls..min(le, ls + 600)] }));
+                record(out, kind, rest[..n], str(end_row + 1, " ", sig), name_at, end_at, r + 1);
+            }
+        }
+        // Calls: a bare name directly before `(`, past the definition's own name.
+        var k = max(ind, def_name_end);
+        while k < line.len {
+            if ident_char(line[k]) && (k == 0 || !ident_char(line[k - 1])) {
+                var e = k;
+                while e < line.len && ident_char(line[e]) { e++; }
+                let word = line[k..e];
+                let qualified = (k >= 1 && line[k - 1] == '.') || (k >= 2 && line[k - 1] == ':' && line[k - 2] == ':');
+                let generic = e < line.len && line[e] == '<';
+                var p = e;
+                if generic { while p < line.len && line[p] != '>' { p++; } if p < line.len { p++; } }
+                if p < line.len && line[p] == '(' && !qualified && !contains(GOOSE_WORDS, word) && !(word[0] >= '0' && word[0] <= '9') {
+                    record(out, "call", word, one_line(trim(text[ls + k..le]), 120), ls + k, ls + e, r + 1);
+                }
+                k = e;
+            } else { k++; }
+        }
+    }
+}
+
 thread_fn extract_worker() {
     loop {
         let job = qget<FileJob>();
         guard job.idx >= 0 else { break; }
         var done = FileDone { idx: job.idx, .. };
         var text: u8[>..] = [];
+        if job.lang == "goose" {
+            if read_file(job.path, text) { goose_scan(text, done.data); }
+            qput(done);
+            continue;
+        }
         if read_file(job.path, text) {
             treesitter::t_text.clear();
             treesitter::t_text.append(text);
