@@ -70,10 +70,73 @@ together: Spread-Wings to find the area, Swan to answer inside it.
    install, watch, LLM). γ = 1 left 3 large groups there, γ = 2 started
    merging unrelated files; 1.5 was the clearest.
 6. **Serve.** CLI and MCP tools read the SQLite file.
+7. **Update** (`src/update.goose`), in place of 1 to 5 once a graph is
+   there. See below.
 
 Label propagation was tried first and dropped: one hub file imported
 everywhere (a crate's `lib.rs`) pulled every file into its community.
 Louvain handles hubs.
+
+## Update
+
+`update` walks the repo as `index` does and compares each file with its
+stamp (size, modification time, inode change time, a hash of the content).
+A file whose size and times are as stamped is not read. Any other is read
+and its hash compared, so a touched file costs a read and nothing more. A
+file written within three seconds of the run keeps no times in its stamp
+and is read again next time: file times move in steps, and a second write
+inside one step would otherwise look unchanged. The inode change time is
+there because a file put back with its old modification time and size
+(`cp -p`, a restore) has still changed.
+
+A changed file's rows are dropped and written again. Its imports are tied
+again; when a file was added or removed, every file's are, since which
+file an import names hangs on which files there are.
+
+The costly part of `index` is tying calls to definitions, and `update`
+runs the same script (`LINK_CALLS_SQL`) on a list of calls instead of all
+of them: comments of the form `/*dirty: ... */` in the script are opened
+into filters when it runs for `update`. The list holds every call whose
+links could differ, by what a call's links hang on:
+
+- its own file's definitions, imports and variables: every call of a file
+  read again, of a file whose imports now name other files, and of a file
+  that binds a variable from a call of a changed name, when a definition
+  of the name says what it returns (`-> Type`): that is what is read off it;
+- the definitions of the name it calls: every call, anywhere, of a name
+  whose definitions in a changed file are not what they were (by kind, the
+  type they belong to, and signature line). A function whose body alone
+  changed keeps its callers' links, which are moved to its new row. A name
+  defined in more than 50 places is only ever tied within the caller's own
+  file and the files it imports, so a change to one is redone only in the
+  files that import the changed file;
+- names passed on by a file (`from .base import f`), names called under
+  another name, and what a function says it returns, each when the import
+  lines of a changed file are not what they were;
+- the repo's top-level names: when a file added or removed changes them,
+  every call.
+
+Past two calls in five the list is dropped and every call is tied, as
+`index` does: the script run on a list pays for the list at each statement.
+
+File links out of the files concerned are summed again, and the groups are
+found again unless the files and every link between them are as they were.
+
+Three things keep the result the graph `index` builds, whatever order the
+rows were written in: a file's node number in the clustering is its place
+in the walk (kept in its stamp), not its row number; weights are summed
+smallest first, so the sum does not hang on the order of the rows; and
+where one of several equally good files is taken, the choice is spelled
+out. `tests/graph_dump.py` prints a graph without row numbers, and the
+checks compare an updated graph with a fresh one after each kind of change.
+
+`RULES_NUMBER` (`src/store.goose`) numbers what `index` writes for a repo.
+A graph written under another number is built whole: half of it under old
+rules and half under new would be neither.
+
+Measured on morluto/rea (7,784 files, 744,582 call sites; `index` 17 s):
+nothing changed 0.02 s; one file edited 0.3 s; a file added or removed
+1.2 s; a folder of 149 test files moved 5.6 s.
 
 ## Evidence model
 
@@ -304,5 +367,6 @@ key comes from the environment at run time (for example through
 - More languages (Java, Kotlin, C/C++, C#, PHP, Lua, Go).
 - A resolution setting for Louvain, and splitting test files apart from the
   code they test.
-- Incremental re-indexing by file content hash.
+- A watcher that runs `update` when files change and tells Swan what to
+  refresh; `compiler` answers kept through an update.
 - Links to Swan: from a Spread-Wings community to Swan's precise map.

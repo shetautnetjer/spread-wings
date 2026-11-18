@@ -1,6 +1,7 @@
 // Spread-Wings: a broad code graph for agents, built from syntax alone.
 //
 //   spread-wings index <repo> <graph.db>     parse, link by name, find communities
+//   spread-wings update <repo> <graph.db>    the same graph, from the files that changed
 //   spread-wings overview <graph.db>         communities and their main files
 //   spread-wings find <graph.db> <name>      definitions by name
 //   spread-wings neighbors <graph.db> <path> a file's imports and call links
@@ -23,6 +24,7 @@ import .decide;
 import .compiler;
 import .score;
 import .survey;
+import .update;
 
 let VERSION = "0.1.0";
 
@@ -48,6 +50,8 @@ fn usage() {
 spread-wings 0.1.0: a broad code graph from syntax alone
 
   spread-wings index <repo> <graph.db> [--resolution N]   (Louvain resolution, default 1.5)
+  spread-wings update <repo> <graph.db> [--resolution N]  bring the graph up to date: reads only the files that
+                                            changed, ties again only the calls they reach (builds it when it is not there)
   spread-wings overview <graph.db>
   spread-wings find <graph.db> <name>
   spread-wings neighbors <graph.db> <path>
@@ -71,9 +75,9 @@ fn abs_dir(p: const u8[:]) -> u8[>..] {
     return out;
 }
 
-fn index_main(repo_arg: const u8[:], db_path: const u8[:], gamma: f64) {
-    let repo = abs_dir(repo_arg);
-    guard is_dir(repo) else { abort(str("spread-wings: not a directory: ", repo)); }
+// Builds the graph of repo (an absolute path) whole, and appends the line
+// that says what it holds to `line`.
+fn index_run(repo: const u8[:], db_path: const u8[:], gamma: f64, line: u8[>..]&) {
     let t0 = clock();
     let db = open_fresh(db_path);
     sqlite::exec_or_die(db, "BEGIN");
@@ -85,15 +89,100 @@ fn index_main(repo_arg: const u8[:], db_path: const u8[:], gamma: f64) {
     set_meta(db, "root", repo);
     set_meta(db, "version", VERSION);
     set_meta(db, "schema", SCHEMA_NUMBER);
+    set_meta(db, "rules", RULES_NUMBER);
     set_meta(db, "resolution", str(((gamma * 100.0 + 0.5) as i64)));
     sqlite::exec_or_die(db, "COMMIT");
     let t2 = clock();
-    print(str("spread-wings: ", n, " files, ", scalar(db, "SELECT COUNT(*) FROM symbols"), " definitions, ",
-              scalar(db, "SELECT COUNT(*) FROM calls"), " call sites, ", imports, " imports linked, ",
-              scalar(db, "SELECT COUNT(*) FROM call_edges"), " call links, ",
-              scalar(db, "SELECT COUNT(*) FROM communities"), " communities (", rounds, " rounds); parse ",
-              ((t1 - t0) * 1000.0) as i64, " ms, link ", ((t2 - t1) * 1000.0) as i64, " ms -> ", db_path));
+    format(line, "spread-wings: ", n, " files, ", scalar(db, "SELECT COUNT(*) FROM symbols"), " definitions, ",
+           scalar(db, "SELECT COUNT(*) FROM calls"), " call sites, ", imports, " imports linked, ",
+           scalar(db, "SELECT COUNT(*) FROM call_edges"), " call links, ",
+           scalar(db, "SELECT COUNT(*) FROM communities"), " communities (", rounds, " rounds); parse ",
+           ((t1 - t0) * 1000.0) as i64, " ms, link ", ((t2 - t1) * 1000.0) as i64, " ms -> ", db_path);
     sqlite::close(db);
+}
+
+fn index_main(repo_arg: const u8[:], db_path: const u8[:], gamma: f64) {
+    let repo = abs_dir(repo_arg);
+    guard is_dir(repo) else { abort(str("spread-wings: not a directory: ", repo)); }
+    var line: u8[>..] = [];
+    index_run(repo, db_path, gamma, line);
+    print(line);
+}
+
+// `update`: the graph index would build now, reached from the one that is
+// there. gamma_arg 0: the resolution the graph was built with. When the
+// graph cannot be brought up to date (none there; another layout or other
+// rules; another folder's; one holding answers from `compiler` or `decide`,
+// which sit on links update would redo), it is built whole, and the answer
+// says why. One JSON object.
+fn update_main(repo_arg: const u8[:], db_path: const u8[:], gamma_arg: f64) {
+    let repo = abs_dir(repo_arg);
+    guard is_dir(repo) else { abort(str("spread-wings: not a directory: ", repo)); }
+    var why: u8[>..] = [];
+    var gamma = if gamma_arg > 0.0 { gamma_arg } else { 1.5 };
+    var regroup = false;
+    var db: i64 = 0;
+    if !file_exists(db_path) {
+        why.append("no graph was there");
+    } else {
+        var err: u8[>..] = [];
+        db = sqlite::open_existing(db_path, err);
+        guard db != 0 else { abort(str("spread-wings: cannot open ", db_path, ": ", err)); }
+        guard scalar(db, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'meta'") == 1 else {
+            abort(str("spread-wings: ", db_path, " is not a spread-wings graph"));
+        }
+        var v: u8[>..] = [];
+        get_meta(db, "schema", v);
+        if v != SCHEMA_NUMBER { why.append("the graph there was written by another version of spread-wings"); }
+        if why.len == 0 {
+            v.clear();
+            get_meta(db, "rules", v);
+            if v != RULES_NUMBER { why.append("the graph there was built under other rules (another spread-wings)"); }
+        }
+        if why.len == 0 {
+            v.clear();
+            get_meta(db, "root", v);
+            if v != repo { format(why, "the graph there was of ", v); }
+        }
+        if why.len == 0 {
+            v.clear();
+            if get_meta(db, "compiler_answers", v) { why.append("the graph there held answers from `compiler`, which update cannot keep: run compiler again"); }
+            else if get_meta(db, "decided_with", v) || scalar(db, "SELECT COUNT(*) FROM decisions") > 0 {
+                why.append("the graph there held answers from `decide`, which update cannot keep: run decide again");
+            }
+        }
+        if why.len == 0 {
+            v.clear();
+            get_meta(db, "resolution", v);
+            let g100, g_ok = parse_int(v);
+            if gamma_arg <= 0.0 {
+                if g_ok && g100 > 0 { gamma = g100 / 100.0; }
+            } else {
+                regroup = !g_ok || g100 != ((gamma * 100.0 + 0.5) as i64);
+            }
+        }
+    }
+    var out: u8[>..] = [];
+    out.push('{');
+    jstr(out, "root", repo);
+    if why.len > 0 {
+        if db != 0 { sqlite::close(db); }
+        var line: u8[>..] = [];
+        index_run(repo, db_path, gamma, line);
+        out.append(",\"built_whole\":true,");
+        jstr(out, "why", why);
+        out.push(',');
+        jstr(out, "index", line);
+    } else {
+        sqlite::exec_or_die(db, "BEGIN");
+        out.append(",\"built_whole\":false,");
+        update_graph(db, repo, gamma, regroup, out);
+        set_meta(db, "resolution", str(((gamma * 100.0 + 0.5) as i64)));
+        sqlite::exec_or_die(db, "COMMIT");
+        sqlite::close(db);
+    }
+    out.append("}\n");
+    write_stdout(out);
 }
 
 // --- queries, as JSON ----------------------------------------------------------
@@ -154,11 +243,14 @@ fn overview(db: i64, out: u8[>..]&) {
         jint(out, "code_files", sqlite::col_int(st, 2)); out.push(',');
         jint(out, "test_files", sqlite::col_int(st, 3)); out.push(',');
         out.append("\"main_files\":");
-        // The files most linked to within and across communities.
+        // The files most linked to within and across communities. (Sums
+        // smallest first, here and below, so that two files as much linked
+        // come out in the same order whatever order the rows were written
+        // in: a graph `update` has touched is not in index's row order.)
         text_list(db, """
             SELECT f.path FROM files f
-            LEFT JOIN (SELECT dst AS id, SUM(weight) AS w FROM file_edges GROUP BY dst) i ON i.id = f.id
-            LEFT JOIN (SELECT src AS id, SUM(weight) AS w FROM file_edges GROUP BY src) o ON o.id = f.id
+            LEFT JOIN (SELECT dst AS id, SUM(weight ORDER BY weight) AS w FROM file_edges GROUP BY dst) i ON i.id = f.id
+            LEFT JOIN (SELECT src AS id, SUM(weight ORDER BY weight) AS w FROM file_edges GROUP BY src) o ON o.id = f.id
             WHERE f.community = ?1
             ORDER BY f.is_test, COALESCE(i.w, 0) + COALESCE(o.w, 0) DESC, f.path LIMIT 5
             """, cid, out);
@@ -168,7 +260,7 @@ fn overview(db: i64, out: u8[>..]&) {
             JOIN call_edges e ON e.callee = s.id
             WHERE f.community = ?1
               AND (SELECT COUNT(DISTINCT t.file_id) FROM symbols t WHERE t.name = s.name) <= 3
-            GROUP BY s.name ORDER BY COUNT(DISTINCT e.file_id) DESC, SUM(e.weight) DESC, s.name LIMIT 5
+            GROUP BY s.name ORDER BY COUNT(DISTINCT e.file_id) DESC, SUM(e.weight ORDER BY e.weight) DESC, s.name LIMIT 5
             """, cid, out);
         out.push('}');
     }
@@ -511,6 +603,16 @@ fn main() {
             gamma = g;
         }
         index_main(a[2], a[3], gamma);
+        return;
+    }
+    if cmd == "update" && (a.len == 4 || (a.len == 6 && a[4] == "--resolution")) {
+        var gamma = 0.0;   // as the graph was built
+        if a.len == 6 {
+            let g, ok = parse_decimal(a[5]);
+            guard ok && g > 0.0 && g <= 10.0 else { abort("spread-wings: --resolution needs a number between 0 and 10"); }
+            gamma = g;
+        }
+        update_main(a[2], a[3], gamma);
         return;
     }
     if cmd == "serve" && a.len == 3 { serve_main(a[2]); return; }

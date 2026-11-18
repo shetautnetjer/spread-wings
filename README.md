@@ -84,13 +84,40 @@ rebuilt to be fast, local and honest about what it knows.
 - Stored in one SQLite file through
   [goose-sqlite](https://github.com/shetautnetjer/goose-sqlite).
 
+## Keeping it up to date
+
+`spread-wings update <repo> <graph.db>` brings a graph up to date with its
+repo without building it again. It finds the files that changed (by size
+and times first; a file that might have changed is read and its content
+compared), reads only those again, and ties again only the calls the change
+can reach: the changed file's own, and the calls elsewhere of a name whose
+definitions are no longer what they were. The graph it leaves is the one
+`index` builds from the same files; the tests compare the two after every
+kind of change (`tests/graph_dump.py` prints a graph without its row
+numbers).
+
+| morluto/rea: 7,784 files, 744,582 call sites | |
+|---|---|
+| `index` | 17 s |
+| `update`, nothing changed | 0.02 s |
+| `update`, one file edited | 0.3 s |
+| `update`, a file added or removed | 1.2 s (every import is tied again: which file an import names hangs on which files there are) |
+| `update`, a folder of 149 test files moved | 5.6 s |
+
+It answers with one JSON object: the files changed, added and removed, how
+many calls were tied again, and the files they are in. With no graph there
+it builds one. A graph it cannot bring up to date (written by another
+version; one holding answers from `compiler` or `decide`, which sit on links
+it would redo) is built whole, and the answer says why.
+
 ## With Swan
 
 Spread-Wings ships inside [Swan](https://github.com/shetautnetjer/Swan) as a
 pinned submodule, and the two split the work on one line: what can be
 learned by only reading files is Spread-Wings (the survey of a repo's
-projects, the broad map, and, to come, watching for changes and pointing
-Swan at what needs a precise look); what needs a compiler-grade tool to run
+projects, the broad map, bringing it up to date from the files that changed
+and, to come, watching for changes and pointing Swan at what needs a precise
+look); what needs a compiler-grade tool to run
 is Swan (exact references, renames, errors, edits, tests). Swan's answers
 come back into the graph through `compiler`, and `score` grades the graph
 against them. The agreed order of work is in Swan's `docs/wings-and-swan.md`.
@@ -100,6 +127,7 @@ against them. The agreed order of work is in Swan's `docs/wings-and-swan.md`.
 ```bash
 scripts/build.sh                      # needs the Goose compiler (GOOSE=/path/to/goose)
 bin/spread-wings index ~/code/myrepo myrepo.db              # --resolution 2 for smaller communities
+bin/spread-wings update ~/code/myrepo myrepo.db             # after edits: the same graph, from the files that changed
 bin/spread-wings overview myrepo.db   # communities, main files, most-called names
 bin/spread-wings find myrepo.db parse_config
 bin/spread-wings neighbors myrepo.db src/config.py
@@ -141,6 +169,9 @@ All output is JSON.
   right on the four test repos); `decide` asks a model about the rest.
 - TypeScript: keys of an object literal that hold a function, namespaces
   and JSX element use (`<Panel />`) are not read.
+- `update` keeps a graph of the rules alone. Answers from `compiler` or
+  `decide` are not kept through it: such a graph is built whole, and the
+  step has to be run again.
 
 ## Documents
 
