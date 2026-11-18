@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "crates/*",
+]
+exclude = ["crates/skip"]
+resolver = "2"

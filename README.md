@@ -69,6 +69,12 @@ rebuilt to be fast, local and honest about what it knows.
   defined in at most 8 places). A bare call never reaches a method, a call
   on an object never a plain function, and no call a definition in another
   language. Every link stores which rule decided it.
+- **The survey** (`survey <repo>`, no graph needed): one entry per project in
+  the repo (a `package.json`, `pyproject.toml`, `Cargo.toml`, `go.mod`, a
+  Maven or Gradle build, `deno.json`), with its package manager, the
+  versions it wants and the file that says so, its workspace and whether
+  the workspace lists it, and whether its dependencies are installed. Read
+  from manifest, lock and version files only; milliseconds.
 - **Communities**: groups of code files that import and call each other,
   found with Louvain clustering (deterministic, resolution 1.5 by default,
   `--resolution N` to change). Test files don't form groups of their own:
@@ -77,6 +83,17 @@ rebuilt to be fast, local and honest about what it knows.
   files and most-called definitions.
 - Stored in one SQLite file through
   [goose-sqlite](https://github.com/shetautnetjer/goose-sqlite).
+
+## With Swan
+
+Spread-Wings ships inside [Swan](https://github.com/shetautnetjer/Swan) as a
+pinned submodule, and the two split the work on one line: what can be
+learned by only reading files is Spread-Wings (the survey of a repo's
+projects, the broad map, and, to come, watching for changes and pointing
+Swan at what needs a precise look); what needs a compiler-grade tool to run
+is Swan (exact references, renames, errors, edits, tests). Swan's answers
+come back into the graph through `compiler`, and `score` grades the graph
+against them. The agreed order of work is in Swan's `docs/wings-and-swan.md`.
 
 ## Use
 
@@ -88,6 +105,7 @@ bin/spread-wings find myrepo.db parse_config
 bin/spread-wings neighbors myrepo.db src/config.py
 bin/spread-wings callers myrepo.db parse_config
 bin/spread-wings touches myrepo.db parse_config   # before an edit: the files, tests and groups it reaches
+bin/spread-wings survey ~/code/myrepo             # the projects it holds: where, which package manager, which versions each wants
 bin/spread-wings serve myrepo.db      # the same four tools over MCP (stdio)
 bin/spread-wings compiler myrepo.db ~/.local/share/swan/maps/myrepo/swan.db   # optional: compiler answers from a Swan map
 bin/spread-wings score myrepo.db ~/.local/share/swan/maps/myrepo/swan.db      # what the definitions and links are worth, per language and rule, against that map
