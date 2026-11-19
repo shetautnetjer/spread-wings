@@ -14,6 +14,7 @@ is ever run). Read [docs/DESIGN.md](docs/DESIGN.md) first.
 | `tests/test.sh` | checks against `tests/fixtures/mini` |
 | `tests/graph_dump.py` | a graph without its row numbers, to compare two graphs of the same files |
 | `tests/random_changes.py` | random changes to a copy of a repo, `update` compared with `index` after each batch (not part of `test.sh`: run it on a real repo after changing `update` or a link rule) |
+| `rust/` | the same program in Rust: a trial ([docs/rust-port.md](docs/rust-port.md)), not what ships. `rust/src/sql.rs` is made from `src/*.goose` by `scripts/sql-from-goose.py` and never edited by hand |
 
 Rules:
 
@@ -37,6 +38,16 @@ Build and test:
 GOOSE=/path/to/goose scripts/build.sh
 tests/test.sh
 ```
+
+The Rust trial builds with `cd rust && cargo build --release` (the program
+is `rust/target/release/spread-wings`) and takes the same suite:
+`SPREAD_WINGS=$PWD/rust/target/release/spread-wings tests/test.sh`, and
+`cargo test --release` for its own few. It writes the same graph as the
+Goose program, file for file, only while it is kept in step: after a change
+to a script in `src/*.goose`, run `scripts/sql-from-goose.py` (a check in
+`tests/test.sh` fails until you do); a change to the Goose code itself has
+to be carried over by hand, and nothing checks that but running the suite
+and `tests/graph_dump.py --hash` with both programs.
 
 Goose specifics worth knowing: a multi-line string's text starts on the
 line after `"""` and the closing `"""` stands on its own line; a call that

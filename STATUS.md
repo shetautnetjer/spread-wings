@@ -400,3 +400,65 @@ Limits:
   from a shell that then closes; under a service manager it lives as long
   as the service.
 - `decide` answers have no `--into`.
+
+## 2026-11-18: a trial in Rust: the same graph, the same checks, the same speed
+
+The owner asked whether this would have been better in Rust, with Goose for
+the parts it suits. Answered with a port on a branch, held to a bar written
+before any Rust was ([docs/rust-port.md](docs/rust-port.md), which has the
+tables, the log and what differs). The Goose program in `src/` is still the
+one that ships; `rust/` is the trial.
+
+- **The same graph.** `index` with the Rust program writes the graph the
+  Goose program writes, by `tests/graph_dump.py --hash`, on the fixtures,
+  Agent-Reach, Understand-Anything, relatedb/relate, morluto/rea and cobra:
+  6 of 6 the same hash. `update` against `index` under
+  `tests/random_changes.py`: six runs on four repos (20, 20, 20, 20, 10 and
+  3 rounds), every round the same. A file's stamp is the same number in
+  both (Goose's `hash`, carried over step for step), so either program can
+  bring the other's graph up to date.
+- **The same checks.** In the microVM with no Goose program in `bin/`: 174
+  of 174 of `tests/test.sh` with the Rust program, and 5 of 5 `cargo test`.
+  The Goose program: 174 of 174. (173 before; the new one holds
+  `rust/src/sql.rs` to the Goose sources, and fails when a script there is
+  changed by hand.)
+- **The same speed.** Medians, one machine, the programs turn about:
+
+  | repo | program | index | update, nothing changed | update, one file edited | watch, idle |
+  |---|---|---|---|---|---|
+  | relate (2,078 files) | Goose | 4.95 s, 97.1 MB | 8.6 ms | 103.9 ms | no CPU, 8.6 MB |
+  | | Rust | 4.84 s, 83.9 MB | 9.3 ms | 102.1 ms | no CPU, 10.0 MB |
+  | rea (7,784 files) | Goose | 16.62 s, 209.1 MB | 20.5 ms | 287.8 ms | no CPU, 10.1 MB |
+  | | Rust | 16.42 s, 182.9 MB | 22.1 ms | 282.0 ms | no CPU, 12.2 MB |
+
+  The time is in tree-sitter and SQLite, which are the same C code in both
+  programs (on rea: 2.7 s reading, 13.6 s linking). The Rust program is
+  8.2 MB, the Goose one 33.5 MB.
+- **What it took.** One session: 26 minutes to the same graph from `index`,
+  38 to every command and the suite, about an hour and a quarter with the
+  table and the records. 4,942 lines of Rust for 5,121 carried over (Goose,
+  its C glue, and the parts of goose-treesitter and goose-sqlite it leans
+  on). The 1,586 lines of scripts are not retyped:
+  `scripts/sql-from-goose.py` takes them from `src/*.goose`. No build failed
+  for a reason in the language, and no stage wrote a different graph at its
+  first build; this was finished code carried over line by line, not new
+  work.
+- Measuring found one thing: the `curl` crate set libcurl and OpenSSL up
+  at every start (half a millisecond and 3.7 MB on every command). `decide`
+  calls libcurl itself now, on the first request, as the C helper does.
+
+Not done, and not proven:
+
+- Nothing is decided. By the owner's rule (tools in Goose, and Rust where
+  it is measurably better) these numbers do not ask for Rust. The other
+  reasons for or against (packages to maintain, who writes the code) are
+  not numbers and are the owner's to weigh.
+- While both are there, a change to the Goose code has to be carried over
+  to `rust/` by hand. Only the scripts are held in step by a check.
+- `decide` has not asked the real service from the Rust program (that
+  costs money). The request is checked against a server on the same
+  machine, and the cache keys against Goose's hash.
+- Errors read differently (no `goose runtime error:` before the message, no
+  source line after), and JSON that is not JSON gets another wording.
+- Swan builds the Goose program from this repository, as before. Nothing in
+  Swan changed.
