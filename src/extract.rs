@@ -1,5 +1,7 @@
 // Facts from source, by syntax tree, never by running anything: definitions,
-// imports and call sites. From src/extract.goose, kept line for line.
+// imports and call sites, found with ast-grep style patterns (ts.rs) on
+// every core. A pattern matches one shape of code, so each language has a
+// few variants (`fn` and `pub fn`, a return type or not).
 
 use crate::db::{Db, Stmt};
 use crate::sql;
@@ -25,11 +27,11 @@ pub fn supported(lang: &str) -> bool {
 
 /// "kind<TAB>capture<TAB>pattern" per line. kind "import" captures the
 /// module, "call" the callee, anything else names a definition. (The lists
-/// themselves are the Goose program's own text.)
+/// are in sql.rs.)
 fn patterns(lang: &str) -> &'static str {
-    if lang == "python" { return sql::EXTRACT_L25; }
-    if lang == "rust" { return sql::EXTRACT_L48; }
-    sql::EXTRACT_L55
+    if lang == "python" { return sql::PATTERNS_PYTHON; }
+    if lang == "rust" { return sql::PATTERNS_RUST; }
+    sql::PATTERNS_JS
 }
 
 struct Compiled { kind: Vec<u8>, capture: Vec<u8>, pattern: Pattern }
@@ -486,8 +488,7 @@ fn goose_scan(text: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-/// One file: its records. What the worker of the Goose program does for
-/// each file it takes from the queue.
+/// One file: its records. What a worker does for each file it takes.
 fn extract_file(path: &[u8], lang: &'static str, known: Option<i64>, kinds: &mut HashMap<&'static str, Vec<i64>>, nodes: &mut Vec<i32>) -> Parsed {
     let mut done = Parsed::default();
     let read = sys::read_file(path);

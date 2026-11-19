@@ -1,5 +1,4 @@
-// The questions over MCP (stdio): one JSON-RPC message per line. From
-// src/spread-wings.goose.
+// The questions over MCP (stdio): one JSON-RPC message per line.
 
 use crate::query::*;
 use crate::sql;
@@ -8,7 +7,7 @@ use crate::util::*;
 use serde_json::Value;
 use std::io::{BufRead, Write};
 
-pub use crate::sql::VERSION;
+pub const VERSION: &str = "0.1.0";
 
 fn add(out: &mut Vec<u8>, s: &str) { out.extend_from_slice(s.as_bytes()); }
 

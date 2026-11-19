@@ -1,5 +1,5 @@
 // The commands that build a graph and keep it: index, update, watch, and
-// the copy `compiler --into` works on. From src/spread-wings.goose.
+// the copy `compiler --into` works on.
 
 use crate::extract::extract_repo;
 use crate::graph::{communities, link_calls, link_imports};

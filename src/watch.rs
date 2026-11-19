@@ -2,7 +2,6 @@
 // it sleeps until something under one of them is written, made, moved or
 // removed. Only a wake-up: what changed is found by `update`. Linux
 // (inotify); elsewhere open says -1 and the watcher looks on a timer.
-// From native/sw_sys.c.
 
 #[cfg(target_os = "linux")]
 mod imp {

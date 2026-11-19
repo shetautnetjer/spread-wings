@@ -1,6 +1,7 @@
-// Byte-string helpers with the meanings the Goose program's builtins have, so
-// its code carries over line for line: text is bytes (a source file need not
-// be UTF-8), `find` gives -1 for "not there", `split` keeps empty parts.
+// Byte-string helpers. Text is bytes (a source file need not be UTF-8),
+// `find` gives -1 for "not there", `split` keeps empty parts: the meanings
+// the program was written with (it began in Goose, and these were its
+// builtins'), which the code that came over from there leans on.
 
 pub fn find(hay: &[u8], needle: &[u8]) -> i64 {
     if needle.is_empty() { return 0; }
@@ -66,15 +67,16 @@ pub fn push_int(out: &mut Vec<u8>, v: i64) { out.extend_from_slice(v.to_string()
 
 pub fn s(b: &[u8]) -> String { String::from_utf8_lossy(b).into_owned() }
 
-/// Says what is wrong and ends the run, as the Goose program's abort does.
+/// Says what is wrong and ends the run.
 pub fn die(msg: &str) -> ! {
     eprintln!("{}", msg);
     std::process::exit(1);
 }
 
-// Goose's `hash` of a byte string (stdlib/std.goose), step for step: a
-// file's stamp and a decision's cache key are this number, so a graph or a
-// cache written by one build reads the same to the other.
+// A hash of a byte string: Goose's `hash` (its stdlib/std.goose), step for
+// step. A file's stamp and a decision's cache key are this number, so the
+// graphs and the cache written while the program was in Goose still read
+// the same. Not to be changed without rebuilding both.
 const K1: u64 = 11400714819323198485;
 const K2: u64 = 15485907386658061715;
 

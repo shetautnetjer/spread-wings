@@ -1,5 +1,9 @@
-// The graph lives in one SQLite file. From src/store.goose; the layout
-// itself (SCHEMA) is the Goose program's own text, in sql.rs.
+// The graph lives in one SQLite file. Facts come straight from the parser
+// (files, definitions, imports, call sites); edges are derived from them by
+// name and say so (`by_name`, with a weight when a name has several
+// definitions).
+//
+// The layout itself (SCHEMA) is in sql.rs.
 
 use crate::db::Db;
 use crate::sql;
@@ -19,10 +23,20 @@ pub fn open_fresh(path: &[u8]) -> Db {
     db
 }
 
-// The layout number (a graph written with another is rebuilt, not read) and
-// the rules number (what index writes for a given repo) are the Goose
-// program's own, taken from src/store.goose with the scripts.
-pub use crate::sql::{RULES_NUMBER, SCHEMA_NUMBER};
+// The number of this file's layout (the tables and columns in SCHEMA). It
+// goes up whenever they change; a graph written with another number is
+// rebuilt, not read: indexing takes seconds, and a command that met a
+// missing column used to stop with a raw SQL error.
+pub const SCHEMA_NUMBER: &str = "8";
+
+// The number of what index writes for a given repo: the readers, the
+// patterns and the link rules. It goes up whenever a change to any of them
+// gives some repo another graph. `update` redoes only what a changed file
+// reaches, so a graph it left half under the old rules and half under the
+// new would be neither: a graph written under another number is rebuilt
+// whole. (tests/test.sh holds the fixtures' graphs to this number: when
+// they change and it has not, a check fails and says to raise it.)
+pub const RULES_NUMBER: &str = "1";
 
 /// `/*tag: text */` in a script is a comment, and the script covers the whole
 /// graph (index). With `on`, each one is opened up into its text, which

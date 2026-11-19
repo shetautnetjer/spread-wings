@@ -1,5 +1,5 @@
 // The questions a graph answers, as JSON: overview, find, neighbors,
-// callers, touches. From src/spread-wings.goose; the queries are its own.
+// callers, touches. The queries are in sql.rs.
 
 use crate::db::Db;
 use crate::sql;
@@ -7,7 +7,7 @@ use crate::store::get_meta;
 use crate::util::*;
 
 /// s as a JSON string: quoted, with '"', '\' and the control characters
-/// escaped (what Goose's json::format_string writes).
+/// escaped; everything else, bytes above 127 included, goes out as it is.
 pub fn jtext(out: &mut Vec<u8>, s: &[u8]) {
     out.push(b'"');
     for &c in s {
@@ -81,9 +81,9 @@ pub fn overview(db: &Db, out: &mut Vec<u8>) {
         jint(out, "code_files", st.col_int(2)); out.push(b',');
         jint(out, "test_files", st.col_int(3)); out.push(b',');
         add(out, "\"main_files\":");
-        text_list(db, sql::SPREAD_WINGS_L349, cid, out);
+        text_list(db, sql::MAIN_FILES_SQL, cid, out);
         add(out, ",\"most_called\":");
-        text_list(db, sql::SPREAD_WINGS_L357, cid, out);
+        text_list(db, sql::MOST_CALLED_SQL, cid, out);
         out.push(b'}');
     }
     add(out, "]}");
@@ -91,7 +91,7 @@ pub fn overview(db: &Db, out: &mut Vec<u8>) {
 
 pub fn find_defs(db: &Db, name: &[u8], out: &mut Vec<u8>) {
     let mut err = String::new();
-    let st = db.prepare_or_die(sql::SPREAD_WINGS_L372.as_bytes());
+    let st = db.prepare_or_die(sql::FIND_SQL.as_bytes());
     st.bind_text(1, name);
     out.push(b'[');
     let mut first = true;
@@ -145,7 +145,7 @@ pub fn neighbors(db: &Db, path: &[u8], out: &mut Vec<u8>) -> bool {
 
 pub fn callers(db: &Db, name: &[u8], out: &mut Vec<u8>) {
     let mut err = String::new();
-    let st = db.prepare_or_die(sql::SPREAD_WINGS_L439.as_bytes());
+    let st = db.prepare_or_die(sql::CALLERS_SQL.as_bytes());
     st.bind_text(1, name);
     add(out, "{\"name\":");
     jtext(out, name);
@@ -173,7 +173,7 @@ pub fn touches(db: &Db, name: &[u8], path: &[u8], out: &mut Vec<u8>) -> bool {
     let mut err = String::new();
     db.exec_or_die(b"DROP TABLE IF EXISTS temp.t_defs; DROP TABLE IF EXISTS temp.t_touch;");
     {
-        let mk = db.prepare_or_die(sql::SPREAD_WINGS_L487.as_bytes());
+        let mk = db.prepare_or_die(sql::TOUCH_DEFS_SQL.as_bytes());
         mk.bind_text(1, name);
         mk.bind_text(2, path);
         mk.step_done();
@@ -185,12 +185,12 @@ pub fn touches(db: &Db, name: &[u8], path: &[u8], out: &mut Vec<u8>) -> bool {
         if !path.is_empty() { add(out, " in "); out.extend_from_slice(path); }
         return false;
     }
-    db.exec_or_die(sql::SPREAD_WINGS_L500.as_bytes());
+    db.exec_or_die(sql::TOUCH_FILES_SQL.as_bytes());
     add(out, "{\"name\":");
     jtext(out, name);
     add(out, ",\"definitions\":[");
     {
-        let ds = db.prepare_or_die(sql::SPREAD_WINGS_L516.as_bytes());
+        let ds = db.prepare_or_die(sql::TOUCH_DEFS_LIST_SQL.as_bytes());
         let mut first = true;
         while ds.step(&mut err) == 1 {
             if !first { out.push(b','); }
@@ -205,7 +205,7 @@ pub fn touches(db: &Db, name: &[u8], path: &[u8], out: &mut Vec<u8>) -> bool {
     }
     add(out, "],\"files\":[");
     {
-        let fs = db.prepare_or_die(sql::SPREAD_WINGS_L537.as_bytes());
+        let fs = db.prepare_or_die(sql::TOUCH_FILES_LIST_SQL.as_bytes());
         let mut first = true;
         while fs.step(&mut err) == 1 {
             if !first { out.push(b','); }
@@ -231,7 +231,7 @@ pub fn touches(db: &Db, name: &[u8], path: &[u8], out: &mut Vec<u8>) -> bool {
     text_list(db, "SELECT f.path FROM t_touch t JOIN files f ON f.id = t.file_id WHERE f.is_test = 1 ORDER BY f.path", 0, out);
     add(out, ",\"communities\":[");
     {
-        let cs = db.prepare_or_die(sql::SPREAD_WINGS_L568.as_bytes());
+        let cs = db.prepare_or_die(sql::TOUCH_GROUPS_SQL.as_bytes());
         let mut first = true;
         while cs.step(&mut err) == 1 {
             if !first { out.push(b','); }

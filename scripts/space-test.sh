@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Runs this checkout's build and tests in a throwaway microVM, not on this
 # machine: a fork of the test checkpoint that Swan's scripts/space-base.sh
-# makes (a clean Ubuntu `cua` Space on Firecracker, with the Goose compiler
-# and both checkouts in place). A fork starts in about a second; it is
+# makes (a clean Ubuntu `cua` Space on Firecracker, with cargo and both
+# checkouts in place). A fork starts in about a second; it is
 # deleted when the run ends.
 #
-#   scripts/space-test.sh                 build, then tests/test.sh
+#   scripts/space-test.sh                 build, `cargo test`, then tests/test.sh
 #   scripts/space-test.sh 'bin/spread-wings index /home/cua/Work/Swan /tmp/s.db'
 #   SW_SPACE_KEEP=1 scripts/space-test.sh      keep the fork to look around
 #
@@ -15,7 +15,6 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 checkpoint=${SW_SPACE_CHECKPOINT:-swan-test-v1}
 guest=/home/cua/Work/spread-wings
-tools=/home/cua/Work/Swan/.tools
 name="wings-test-$(date +%H%M%S)-$$"
 
 command -v cua >/dev/null 2>&1 || { echo "space-test: the cua CLI is not installed" >&2; exit 2; }
@@ -43,6 +42,6 @@ cua sb exec "$name" --timeout 300 -- \
 echo "space-test: $name ready in $(( $(date +%s) - t0 )) s (fork of $checkpoint, tree synced)" >&2
 
 if [ $# -eq 0 ]; then
-  set -- "GOOSE=$tools/goose/goose-v2026.3-linux-x64/goose GOOSE_HOME=$tools/goose-home scripts/build.sh >/tmp/build.log 2>&1 || { tail -30 /tmp/build.log; exit 1; }; tests/test.sh"
+  set -- "scripts/build.sh >/tmp/build.log 2>&1 || { tail -30 /tmp/build.log; exit 1; }; cargo test --release --locked >/tmp/cargo-test.log 2>&1 || { tail -30 /tmp/cargo-test.log; exit 1; }; grep '^test result' /tmp/cargo-test.log; tests/test.sh"
 fi
 cua sb exec "$name" --cwd "$guest" --timeout 0 -- "$*"

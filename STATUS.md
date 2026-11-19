@@ -462,3 +462,41 @@ Not done, and not proven:
   source line after), and JSON that is not JSON gets another wording.
 - Swan builds the Goose program from this repository, as before. Nothing in
   Swan changed.
+
+## 2026-11-18: Rust is what is built; the Goose program is retired
+
+After the trial above the owner chose Rust ("I think I will stay rust"), for
+reasons beyond its numbers: easier to build on, to carry other tools' ideas
+into (he named Graphify) and to add languages to. This change makes it so.
+
+- `scripts/build.sh` builds the program with cargo (`--locked`: the crate
+  versions `Cargo.lock` pins) and puts it at `bin/spread-wings`, where
+  everything already looks for it.
+- The repository is the Rust project: `Cargo.toml` at the top, `src/*.rs`.
+  `src/*.goose` and `native/` are gone; as they last were, they are at
+  commit `d7a8db1`.
+- What was written beside the code came along. Each script in `src/sql.rs`
+  stands with the comment that stood above it in the Goose sources, under a
+  name that says what it is (39 had been named after a line number). Each
+  module opens with the comment its Goose file opened with. The layout and
+  rules numbers are in `src/store.rs`.
+- `scripts/sql-from-goose.py` and its check went with the sources they
+  read. The suite is the 173 checks it was before the trial, and
+  `scripts/space-test.sh` runs `cargo test` (5) before it.
+- Checked: built this way, the program writes the graph the last Goose
+  build writes, by `tests/graph_dump.py --hash`, on the fixtures and the
+  five repos (6 of 6). In the microVM: 173 of 173, and 5 of 5.
+
+Not done:
+
+- Swan still builds the Goose program, from the commit its `wings/` points
+  at. Its build script has to change together with that pin: the next
+  change, in Swan.
+- A program already installed is not replaced by this. It stays a Goose
+  build until it is built again.
+- An error no longer starts with `goose runtime error:` or ends with a
+  source line. Nothing in this repository or its checks reads those;
+  whatever else does would need a look.
+- `decide` has still not asked the real service from the Rust program.
+- No Rust version is pinned. Built and checked with cargo 1.98.1 (the
+  microVM) and 1.100.0.

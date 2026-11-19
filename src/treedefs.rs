@@ -1,6 +1,40 @@
-// Definitions read from the syntax tree, by the kind of each node, for
-// TypeScript, TSX, JavaScript and Rust. From src/treedefs.goose, which says
-// why and what counts as a definition; the two are kept line for line.
+// Definitions read from the syntax tree, by the kind of each node.
+//
+// Spread-Wings found definitions with a list of shapes per language
+// (`const $NAME = ($$$A) => $B`, `pub fn $NAME($$$A) -> $R { $$$B }`). A
+// shape matches one spelling: a return type, a type on the constant, type
+// parameters, `pub(crate)`, `const fn` or `where` each need another line in
+// the list, and a class method had no shape at all. Measured against Swan's
+// compiler-resolved map on 2026-11-18 (docs/measured-against-swan-2026-11-18.md):
+// of the definitions that morluto/rea's own calls reach, the graph was
+// missing 19,606 of 23,991: 15,980 constants holding a function (97% of a
+// sample were `const f = (a: T): R => ...`), 2,570 methods, 675 properties
+// with a function type and 230 functions (generators, overloads). On
+// relatedb/relate it had 79% of the structs and 65% of the traits.
+//
+// A grammar names every kind of node, so a definition is recognised by what
+// it is, however it is spelled. This reader does that for TypeScript, TSX,
+// JavaScript and Rust. Python's shapes cover its definitions (100% on three
+// repos) and stay as they were; imports, calls and bindings are still read
+// by shape for every language.
+//
+// What becomes a definition:
+//   function   a function declaration or generator; a method, getter or
+//              setter; a `declare`d function; a method or function-typed
+//              property of an interface, class or object type; a constant
+//              whose value is a function, a call that is handed a function
+//              (`memo(() => ...)`, `create<S>((set) => ...)`), or a call
+//              whose result this file itself calls (`const run =
+//              promisify(execFile); run(...)`); Rust: `fn`, with or without
+//              a body
+//   class, interface, enum, type, struct (and union), trait, impl
+// The overloads of one TypeScript function (its signatures, then the
+// implementation) are one definition, from the first signature to the end
+// of the body.
+//
+// Not read: a key of an object literal whose value is a function (`{ k: () =>
+// 1 }`; a method written in one, `{ m() {} }`, is read), namespaces, enum
+// members, Rust macros and consts.
 
 use crate::extract::{callee_name, count_newlines, record};
 use crate::ts::{self, F_EXTRA, F_NAMED, R};

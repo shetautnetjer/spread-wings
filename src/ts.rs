@@ -1,14 +1,15 @@
 // Syntax trees as flat tables, and ast-grep style patterns over them.
 //
-// Carried over from goose-treesitter (ts_shim.c and treesitter.goose), which
-// the Goose program leans on: a tree is R ints for each node, in pre-order
-// (symbol, flags, start and end byte, start row and column, first child,
-// next sibling; -1 for none), and a pattern (`def $NAME($$$A): $$$B`) is
-// code of the language with its metavariables renamed to identifiers,
-// parsed by the same grammar and matched node against node.
+// A tree is R ints for each node, in pre-order (symbol, flags, start and
+// end byte, start row and column, first child, next sibling; -1 for none),
+// and a pattern (`def $NAME($$$A): $$$B`) is code of the language with its
+// metavariables renamed to identifiers, parsed by the same grammar and
+// matched node against node. (Carried over from goose-treesitter, which the
+// program used while it was written in Goose.)
 //
-// The grammars are the crates of the versions goose-treesitter pins, and the
-// runtime is the `tree-sitter` crate of its version (0.25.10).
+// The grammars and the tree-sitter runtime are crates, at versions pinned
+// in Cargo.toml: a newer grammar can parse the same file into another
+// tree, and so into another graph (rule 6 in AGENTS.md).
 
 use crate::util::*;
 use tree_sitter::{Language, Parser, Tree};

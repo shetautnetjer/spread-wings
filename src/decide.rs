@@ -1,10 +1,20 @@
 // Decisions with Span-02 (respan/span-02, through OpenRouter's System One
 // endpoint): for each call the code alone couldn't tie to one definition
 // (resolution by_name), a typed choice among the candidate definitions plus
-// "outside this repo", answered with probabilities. From src/decide.goose,
-// which sets out the cost reasoning; the scripts are its own (sql.rs).
-// Answers are cached by content in ~/.cache/spread-wings/decisions.db, under
-// the same keys the Goose build writes (util::hash is Goose's hash).
+// "outside this repo", answered with probabilities. Never free text, so it
+// can't invent a definition.
+//
+// Cost is the state's tokens times the number of questions (measured: a
+// state is billed once per question), while a request with 50 questions
+// takes about as long as one with 1. So the state is kept small (the
+// caller's own function), the questions that share it go in one request,
+// and requests run in parallel on worker threads. Answers are cached by
+// content in ~/.cache/spread-wings/decisions.db: unchanged code is never
+// asked twice.
+//
+// The cache's keys are util::hash of the model, the state and the question:
+// the hash the program has always used, so answers cached before the move
+// to Rust are still found.
 
 use crate::db::Db;
 use crate::graph::{call_file_edges, communities};
@@ -18,7 +28,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::sql::{KEY_ENV, MODEL, URL};
+const MODEL: &str = "respan/span-02";
+const URL: &str = "https://openrouter.ai/api/v1/systemone";
+const KEY_ENV: &str = "OPENROUTER_API_KEY";
 const MAX_PER_REQUEST: i64 = 8; // questions per cluster of nearby calls (one small state each)
 const MIN_P: i64 = 600; // thousandths: a choice below 0.6 changes nothing
 const WINDOW: i64 = 4;
@@ -30,8 +42,7 @@ fn add(out: &mut Vec<u8>, t: &str) { out.extend_from_slice(t.as_bytes()); }
 /// key is missing or the request could not be made. The key is read from
 /// the environment here, by name, and goes nowhere but the header.
 ///
-/// Through libcurl itself (curl-sys), as native/sw_http.c does it, and set
-/// up on the first request: the `curl` crate sets libcurl and OpenSSL up
+/// Through libcurl itself (curl-sys), set up on the first request: the `curl` crate sets libcurl and OpenSSL up
 /// when the program starts, which cost every command, `find` included,
 /// half a millisecond and 3.7 MB (measured 2026-11-18).
 fn http_post(url: &str, key_env: &str, body: &[u8], timeout_s: i64, out: &mut Vec<u8>) -> i64 {
@@ -165,10 +176,10 @@ pub fn decide_main(db_path: &[u8], max_questions: i64, max_workers: i64) {
     let mut from_cache: i64 = 0;
     {
         // Each still-ambiguous call site, grouped by the function it sits in.
-        let sites_st = db.prepare_or_die(sql::DECIDE_L101.as_bytes());
-        let cand_st = db.prepare_or_die(sql::DECIDE_L110.as_bytes());
+        let sites_st = db.prepare_or_die(sql::DECIDE_SITES_SQL.as_bytes());
+        let cand_st = db.prepare_or_die(sql::DECIDE_CANDIDATES_SQL.as_bytes());
         let imp_st = db.prepare_or_die(b"SELECT DISTINCT module FROM imports WHERE file_id = ?1 ORDER BY row");
-        let rows_st = db.prepare_or_die(sql::DECIDE_L136.as_bytes());
+        let rows_st = db.prepare_or_die(sql::DECIDE_ROWS_SQL.as_bytes());
 
         let mut cur_group: i64 = -1;
         let mut cur_file: i64 = -1;
@@ -452,12 +463,19 @@ pub fn decide_main(db_path: &[u8], max_questions: i64, max_workers: i64) {
 }
 
 /// Writes the rows of `decisions` into the links. Returns how many answers
-/// were not used (the two reasons are set out in src/decide.goose).
+/// were not used, for one of two reasons:
+///   - the answer names a definition that was not one of that call's
+///     by_name candidates. Nothing offered it, so it is not an answer;
+///     taking it would delete every real candidate and link nothing.
+///   - links are kept per line and name, and two calls of one name on a line
+///     (`a.render(), b.render()`) got answers that differ, or only one of
+///     them a sure one. Writing either would overwrite the other call's
+///     links, so both stay by_name.
 fn apply_decisions(db: &Db) -> i64 {
     let before = db.scalar(b"SELECT COUNT(*) FROM decisions");
-    db.exec_or_die(sql::DECIDE_L435.as_bytes());
+    db.exec_or_die(sql::DECIDE_DROP_SQL.as_bytes());
     let dropped = before - db.scalar(b"SELECT COUNT(*) FROM decisions");
-    db.exec_or_die(sql::DECIDE_L448.as_bytes());
+    db.exec_or_die(sql::DECIDE_APPLY_SQL.as_bytes());
     dropped
 }
 

@@ -1,5 +1,12 @@
-// From facts to edges, and edges to communities. From src/graph.goose, kept
-// line for line; every script is the Goose program's own text (sql.rs).
+// From facts to edges, and edges to communities. Every edge here is
+// matched by name or by path, not resolved by a compiler: `by_name` says so,
+// and a name with several definitions spreads its weight across them.
+//
+// Calls link to functions, classes, structs, enums, traits and interfaces.
+// A name defined more than 8 times is too common to link by name (`new`,
+// `get`, `run`): its calls stay as facts without edges.
+//
+// The scripts are in sql.rs.
 
 use crate::db::{Db, Stmt};
 use crate::sql;
@@ -174,9 +181,11 @@ fn add_alias(st: &Stmt, file: i64, alias: &[u8], dst: i64) {
 /// the imports of the files read again (temp.u_changed): theirs are new rows.
 pub fn link_imports(db: &Db, only_changed: bool) -> i64 {
     let mut err = String::new();
-    // The imports to tie are listed first, then read from the list (see the
-    // Goose source for why).
-    db.exec_or_die(&open_marks(sql::GRAPH_L221.as_bytes(), b"only", only_changed));
+    // The imports to tie are listed first, then read from the list: the
+    // loop below writes each one's file into the row it came from, and a
+    // row found through an index on what is being written (which is how
+    // the imports of a few files are found) can come round a second time.
+    db.exec_or_die(&open_marks(sql::IMPORTS_TODO_SQL.as_bytes(), b"only", only_changed));
     let q = db.prepare_or_die(b"SELECT file_id, path, lang, module, r, names FROM temp.imp_todo ORDER BY rowid");
     let ins_alias = db.prepare_or_die(b"INSERT INTO aliases (file_id, alias, dst) VALUES (?1, ?2, ?3)");
     let set_dst = db.prepare_or_die(b"UPDATE imports SET dst = ?2 WHERE rowid = ?1");
@@ -245,8 +254,23 @@ pub fn link_imports(db: &Db, only_changed: bool) -> i64 {
 }
 
 /// Each call site is tied to the definitions its name could mean, by the
-/// strongest evidence the code gives (the rules are the script's own).
-/// With only_dirty (update), only the calls listed in temp.dirty are tied.
+/// strongest evidence the code gives, first match wins:
+///   own_type       `this.f()` / `self.f()` / `Self::f()`: the f of the type
+///                  the calling method belongs to;
+///   type_name      `Type::f()` / `Type.f()`: the f of the type named;
+///   same_file      a definition with that name in the caller's own file;
+///   imported_name  the caller's file imports that name from a file that
+///                  defines it (`from m import f`, `import { f }`, `use m::F`);
+///   imported_file  the caller's file imports a file that defines it;
+///   by_name        any definition with that name (only for names defined in
+///                  at most 8 places).
+/// Several definitions at one level share the call's weight. The rule used
+/// is stored on the link as `resolution`.
+///
+/// With only_dirty (update), only the calls listed in temp.dirty are tied,
+/// with temp.dirty_files holding the files they are in: every other call
+/// keeps the links and the note it has. What a call's answer hangs on, and
+/// so which calls update must list, is set out in update.rs.
 pub fn link_calls(db: &Db, only_dirty: bool) {
     make_roots(db);
     db.exec_or_die(&open_marks(sql::LINK_CALLS_SQL.as_bytes(), b"dirty", only_dirty));
@@ -254,9 +278,12 @@ pub fn link_calls(db: &Db, only_dirty: bool) {
 }
 
 /// The repo's own top-level names: an import whose first segment is none of
-/// them comes from outside the repo.
+/// them comes from outside the repo. They hang on the paths of the files
+/// alone, so update compares roots_text before and after: when a file added
+/// or removed changes them, any call may be outside that was not, and all
+/// are tied again.
 pub fn make_roots(db: &Db) {
-    db.exec_or_die(sql::GRAPH_L330.as_bytes());
+    db.exec_or_die(sql::ROOTS_SQL.as_bytes());
 }
 
 pub fn roots_text(db: &Db) -> Vec<u8> {
@@ -275,15 +302,19 @@ pub fn roots_text(db: &Db) -> Vec<u8> {
 }
 
 /// File links from call links. With only_dirty (update), those out of the
-/// files in temp.dirty_files, in place of the ones they had.
+/// files in temp.dirty_files, in place of the ones they had: a file's links
+/// out hang on its own calls' links and, for a link by name, on how many
+/// files define the name, and a name defined in more or fewer files than
+/// before has had every call of it tied again.
 pub fn call_file_edges(db: &Db, only_dirty: bool) {
-    db.exec_or_die(&open_marks(sql::GRAPH_L832.as_bytes(), b"dirty", only_dirty));
+    db.exec_or_die(&open_marks(sql::CALL_FILE_EDGES_SQL.as_bytes(), b"dirty", only_dirty));
 }
 
 /// One level of Louvain's local moving on a graph in CSR form (off, nbr, w):
 /// each node moves to the neighboring community with the best modularity
-/// gain until no node moves. Returns true if any node moved. (The sums are
-/// taken in the Goose program's order: the last digit of a sum hangs on it.)
+/// gain until no node moves. Returns true if any node moved. (The order the
+/// sums are taken in is part of the rules: the last digit of a sum hangs on
+/// it, and a move can hang on that digit.)
 fn local_moving(n: usize, off: &[i64], nbr: &[i64], w: &[f64], comm: &mut [i64], gamma: f64) -> bool {
     let mut k: Vec<f64> = vec![0.0; n];
     let mut tot: Vec<f64> = vec![0.0; n];
@@ -341,7 +372,8 @@ fn load_csr(db: &Db, table: &str, n: usize, off: &mut Vec<i64>, nbr: &mut Vec<i6
     nbr.clear();
     w.clear();
     off.resize(n + 1, 0);
-    // Weights as integers in thousandths, as the Goose program reads them.
+    // Weights as integers in thousandths (part of the rules: the groups
+    // were found on weights read this way from the start).
     let st = db.prepare_or_die(format!("SELECT a, b, CAST(ROUND(w * 1000) AS INTEGER) FROM {} ORDER BY a, b", table).as_bytes());
     let mut row_a: Vec<i64> = Vec::new();
     while st.step(&mut err) == 1 {
@@ -356,6 +388,14 @@ fn load_csr(db: &Db, table: &str, n: usize, off: &mut Vec<i64>, nbr: &mut Vec<i6
 /// Louvain over the undirected file graph (imports and by-name calls,
 /// weighted): local moving, then each community becomes one node, until
 /// nothing moves. Deterministic: same repo, same communities.
+/// gamma is Louvain's resolution: 1 is plain modularity; higher splits the
+/// graph into more, smaller communities.
+///
+/// A file's node number is its place in the walk (temp.ford), not its row
+/// number: a graph update has added files to or taken files from has rows
+/// out of that order and gaps between them, and the moves below go node by
+/// node. In a graph straight from index the two are the same. A graph from
+/// before stamps were kept has no places: its row numbers serve.
 pub fn communities(db: &Db, gamma: f64) -> i64 {
     let n = db.scalar(b"SELECT COUNT(*) FROM files") as usize;
     db.exec_or_die(b"DROP TABLE IF EXISTS temp.ford; CREATE TEMP TABLE ford (id INTEGER PRIMARY KEY, ord INTEGER)");
@@ -373,7 +413,7 @@ pub fn communities(db: &Db, gamma: f64) -> i64 {
         while ford_st.step(&mut ford_err) == 1 { ids.push(ford_st.col_int(0)); }
     }
     // Tests are grouped with the code they exercise, not with each other.
-    db.exec_or_die(sql::GRAPH_L956.as_bytes());
+    db.exec_or_die(sql::GROUPS_START_SQL.as_bytes());
     let mut member: Vec<i64> = (0..n as i64).collect(); // file index -> current community
     let mut size = n;
     let mut levels: i64 = 0;
@@ -403,7 +443,7 @@ pub fn communities(db: &Db, gamma: f64) -> i64 {
                 ins.step_done();
             }
         }
-        db.exec_or_die(sql::GRAPH_L1005.as_bytes());
+        db.exec_or_die(sql::GROUPS_NEXT_LEVEL_SQL.as_bytes());
         if !((c as usize) < size) { break; }
         size = c as usize;
     }
@@ -417,10 +457,10 @@ pub fn communities(db: &Db, gamma: f64) -> i64 {
         }
     }
     // Each test file joins the code community it links to most.
-    db.exec_or_die(sql::GRAPH_L1027.as_bytes());
+    db.exec_or_die(sql::TEST_VOTES_SQL.as_bytes());
     let rounds = levels;
     // Number the communities by their code files (unlinked tests last) and
     // name each after its most linked code file.
-    db.exec_or_die(sql::GRAPH_L1043.as_bytes());
+    db.exec_or_die(sql::GROUPS_NUMBER_SQL.as_bytes());
     rounds
 }

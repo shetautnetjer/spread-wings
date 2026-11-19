@@ -1,6 +1,36 @@
 // The survey: which projects a repo holds, where, and what each expects.
-// It only reads: no package manager, interpreter or build file of the repo
-// is run. From src/survey.goose, which says what is read and why.
+//
+// A repo is rarely one project at its top. It is a workspace of packages, a
+// Python service beside a web client, a Rust crate with a fuzz crate inside
+// it; each with its own manifest, package manager and wanted versions. A
+// tool that assumes one project at the top gets the others wrong or misses
+// them (Swan, 2026-11-17/18: a nested cargo crate had no rows, a package
+// with its own tsconfig lost its imports, Go below the top was run from the
+// top).
+//
+// `spread-wings survey <repo>` reads the files that say these things and
+// reports them, one entry per project:
+//   node    package.json: name, package manager (the `packageManager` field,
+//           else the lock file here or above), wanted Node/bun (.nvmrc,
+//           .node-version, volta, mise.toml, .tool-versions; `engines` as
+//           the range it is, under node.requires),
+//           workspace root and membership, whether node_modules is there,
+//           the test script, the TypeScript version and tsconfig files
+//   python  pyproject.toml, setup.py, setup.cfg or requirements.txt: name,
+//           manager (uv, poetry, pdm, pipenv, pip), wanted Python
+//           (.python-version, requires-python), the virtualenv and its Python
+//   rust    Cargo.toml: package, workspace, wanted toolchain
+//           (rust-toolchain[.toml], rust-version)
+//   go      go.mod: module, Go version, go.work above it
+//   java    pom.xml or a Gradle build; deno: deno.json
+// A version or manager set in a folder holds for the folders below it until
+// one of them says otherwise; each value names the file it came from.
+//
+// It only reads. No package manager, interpreter or build file of the repo
+// is run, so it needs no trust and takes milliseconds. It does not check
+// that a wanted version is installed on this machine, and it does not read
+// .gitignore: folders the walk always skips (node_modules, target, dist,
+// build, hidden ones) are the only ones left out.
 
 use crate::extract::SKIP_DIRS;
 use crate::query::jtext as jstring;

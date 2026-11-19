@@ -1,6 +1,20 @@
-// Spread-Wings in Rust: a trial port of the Goose program, held to the same
-// graph and the same checks (docs/rust-port.md). The commands, their
-// arguments and their answers are those of src/spread-wings.goose.
+// Spread-Wings: a broad code graph for agents, built from syntax alone.
+//
+//   spread-wings index <repo> <graph.db>     parse, link by name, find communities
+//   spread-wings update <repo> <graph.db>    the same graph, from the files that changed
+//   spread-wings watch <repo> <graph.db>     stay awake and update it as files change
+//   spread-wings overview <graph.db>         communities and their main files
+//   spread-wings find <graph.db> <name>      definitions by name
+//   spread-wings neighbors <graph.db> <path> a file's imports and call links
+//   spread-wings callers <graph.db> <name>   call sites of a name
+//   spread-wings serve <graph.db>            the same over MCP (stdio)
+//
+// It never runs a repo's code: everything comes from tree-sitter parses, so
+// any repo can be indexed with nothing to trust. Edges are matched by name
+// or by path, not resolved by a compiler; Swan is the precise counterpart.
+//
+// Written first in Goose; carried over to Rust on 2026-11-18, held to the
+// same graph and the same checks (docs/rust-port.md).
 
 mod compiler;
 mod db;
@@ -23,8 +37,8 @@ mod watch;
 use std::io::Write;
 use util::*;
 
-/// "1.25" -> 1.25, by the Goose program's own steps (so that a resolution
-/// reads as the same number in both).
+/// "1.25" -> 1.25, digit by digit (how a resolution has always been read: the
+/// same text must stay the same number, the groups hang on it).
 fn parse_decimal(s: &[u8]) -> Option<f64> {
     let dot = find(s, b".");
     let whole = parse_int(if dot >= 0 { &s[..dot as usize] } else { s })?;
@@ -41,7 +55,7 @@ fn parse_decimal(s: &[u8]) -> Option<f64> {
 }
 
 fn usage() -> ! {
-    let t = sql::SPREAD_WINGS_L50;
+    let t = sql::USAGE;
     let t = t.strip_prefix('\n').unwrap_or(t);
     let t = t.strip_suffix('\n').unwrap_or(t);
     let _ = std::io::stderr().write_all(t.as_bytes());
@@ -56,9 +70,9 @@ fn resolution(a: &[u8]) -> f64 {
 }
 
 fn main() {
-    // A reader that goes away ends the program at its next line, as it ends
-    // the Goose one (Rust would otherwise carry on writing to nobody: a
-    // watcher whose reader has gone must not stay).
+    // A reader that goes away ends the program at its next line (Rust would
+    // otherwise carry on writing to nobody: a watcher whose reader has gone
+    // must not stay).
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL); }
     let a: Vec<Vec<u8>> = std::env::args_os().map(std::os::unix::ffi::OsStringExt::into_vec).collect();
     if a.len() < 3 { usage(); }
@@ -67,16 +81,6 @@ fn main() {
         // (measured: on a test-heavy repo, 1.5 splits code into its modules)
         let gamma = if a.len() == 6 { resolution(&a[5]) } else { 1.5 };
         run::index_main(&a[2], &a[3], gamma);
-        return;
-    }
-    if cmd == b"facts" && a.len() == 4 {
-        // A stage of the port, not a command of the Goose program: the facts alone.
-        let repo = run::abs_dir(&a[2]);
-        let db = store::open_fresh(&a[3]);
-        db.exec_or_die(b"BEGIN");
-        let n = extract::extract_repo(&db, &repo);
-        db.exec_or_die(b"COMMIT");
-        println!("{} files", n);
         return;
     }
     if cmd == b"update" && (a.len() == 4 || (a.len() == 6 && a[4] == b"--resolution")) {

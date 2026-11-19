@@ -511,13 +511,7 @@ check "compiler --into: the copy cannot be the graph itself" "import subprocess;
 # graphs are held to it here, so a change to a reader, a pattern or a link
 # rule that alters them cannot go in with the number as it was.
 rules_hash() { for x in mini kinds rules esm goose nested outside; do "$SW" index "tests/fixtures/$x" "$work/rh.db" >/dev/null; python3 tests/graph_dump.py "$work/rh.db"; done | sha256sum | cut -c1-16; }
-eq "rules: the fixtures' graphs are those of this rules number (a reader, pattern or link rule changed them: raise RULES_NUMBER in src/store.goose and put '<number>:<hash>' here; only a fixture changed: the hash)" "$(sed -n 's/^let RULES_NUMBER = "\(.*\)";/\1/p' src/store.goose):$(rules_hash)" "1:8823e4165eb7e8c3"
-
-# The Rust trial (docs/rust-port.md) runs the Goose program's own scripts:
-# rust/src/sql.rs is made from src/*.goose and never edited by hand.
-if [ -f rust/src/sql.rs ]; then
-  check "rust trial: rust/src/sql.rs is what src/*.goose give now (else: scripts/sql-from-goose.py)" "import subprocess; r=subprocess.run(['python3','scripts/sql-from-goose.py','--check'],capture_output=True); assert r.returncode == 0"
-fi
+eq "rules: the fixtures' graphs are those of this rules number (a reader, pattern or link rule changed them: raise RULES_NUMBER in src/store.rs and put '<number>:<hash>' here; only a fixture changed: the hash)" "$(sed -n 's/^pub const RULES_NUMBER: &str = "\(.*\)";/\1/p' src/store.rs):$(rules_hash)" "1:8823e4165eb7e8c3"
 
 echo
 echo "$pass passed, $fail failed"
