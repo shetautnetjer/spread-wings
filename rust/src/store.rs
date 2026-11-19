@@ -19,13 +19,10 @@ pub fn open_fresh(path: &[u8]) -> Db {
     db
 }
 
-/// The number of the file's layout; a graph written with another number is
-/// rebuilt, not read.
-pub const SCHEMA_NUMBER: &str = "8";
-
-/// The number of what index writes for a given repo: the readers, the
-/// patterns and the link rules.
-pub const RULES_NUMBER: &str = "1";
+// The layout number (a graph written with another is rebuilt, not read) and
+// the rules number (what index writes for a given repo) are the Goose
+// program's own, taken from src/store.goose with the scripts.
+pub use crate::sql::{RULES_NUMBER, SCHEMA_NUMBER};
 
 /// `/*tag: text */` in a script is a comment, and the script covers the whole
 /// graph (index). With `on`, each one is opened up into its text, which

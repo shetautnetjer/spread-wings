@@ -87,9 +87,6 @@ impl Stmt {
     pub fn bind_int(&self, i: i32, v: i64) {
         unsafe { ffi::sqlite3_bind_int64(self.0, i, v); }
     }
-    pub fn bind_f64(&self, i: i32, v: f64) {
-        unsafe { ffi::sqlite3_bind_double(self.0, i, v); }
-    }
     /// 1 a row, 0 done, -1 an error (its text in err).
     pub fn step(&self, err: &mut String) -> i32 {
         unsafe {
@@ -115,7 +112,6 @@ impl Stmt {
         self.reset();
     }
     pub fn col_int(&self, i: i32) -> i64 { unsafe { ffi::sqlite3_column_int64(self.0, i) } }
-    pub fn col_f64(&self, i: i32) -> f64 { unsafe { ffi::sqlite3_column_double(self.0, i) } }
     pub fn col_text(&self, i: i32) -> Vec<u8> {
         unsafe {
             let p = ffi::sqlite3_column_text(self.0, i);
@@ -124,7 +120,6 @@ impl Stmt {
             std::slice::from_raw_parts(p, n).to_vec()
         }
     }
-    pub fn col_str(&self, i: i32) -> String { String::from_utf8_lossy(&self.col_text(i)).into_owned() }
     /// Ready to run again, with no parameters set.
     pub fn reset(&self) {
         unsafe {

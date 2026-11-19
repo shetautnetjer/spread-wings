@@ -2,7 +2,9 @@
 // graph and the same checks (docs/rust-port.md). The commands, their
 // arguments and their answers are those of src/spread-wings.goose.
 
+mod compiler;
 mod db;
+mod decide;
 mod extract;
 mod graph;
 mod query;
@@ -10,10 +12,13 @@ mod run;
 mod serve;
 mod sql;
 mod store;
+mod survey;
 mod sys;
 mod treedefs;
 mod ts;
+mod update;
 mod util;
+mod watch;
 
 use std::io::Write;
 use util::*;
@@ -51,6 +56,10 @@ fn resolution(a: &[u8]) -> f64 {
 }
 
 fn main() {
+    // A reader that goes away ends the program at its next line, as it ends
+    // the Goose one (Rust would otherwise carry on writing to nobody: a
+    // watcher whose reader has gone must not stay).
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL); }
     let a: Vec<Vec<u8>> = std::env::args_os().map(std::os::unix::ffi::OsStringExt::into_vec).collect();
     if a.len() < 3 { usage(); }
     let cmd = &a[1][..];
@@ -70,7 +79,58 @@ fn main() {
         println!("{} files", n);
         return;
     }
+    if cmd == b"update" && (a.len() == 4 || (a.len() == 6 && a[4] == b"--resolution")) {
+        // (0: as the graph was built)
+        let gamma = if a.len() == 6 { resolution(&a[5]) } else { 0.0 };
+        run::update_main(&a[2], &a[3], gamma);
+        return;
+    }
     if cmd == b"serve" && a.len() == 3 { serve::serve_main(&a[2]); return; }
+    if cmd == b"compiler" && a.len() == 4 {
+        compiler::compiler_main(&a[2], &a[3]);
+        return;
+    }
+    if cmd == b"compiler" && a.len() == 6 && a[4] == b"--into" {
+        run::copy_graph(&a[2], &a[5]);
+        compiler::compiler_main(&a[5], &a[3]);
+        return;
+    }
+    if cmd == b"watch" && (a.len() == 4 || (a.len() == 6 && a[4] == b"--every")) {
+        let mut every: i64 = 30;
+        if a.len() == 6 {
+            every = match parse_int(&a[5]) {
+                Some(v) if v >= 1 && v <= 86400 => v,
+                _ => die("spread-wings: --every needs a number of seconds, 1 to 86400"),
+            };
+        }
+        run::watch_main(&a[2], &a[3], 0.0, every);
+        return;
+    }
+    if cmd == b"decide-apply" && a.len() == 3 {
+        decide::decide_apply_main(&a[2]);
+        return;
+    }
+    if cmd == b"survey" && a.len() == 3 {
+        survey::survey_main(&a[2]);
+        return;
+    }
+    if cmd == b"score" && a.len() == 4 {
+        compiler::score_main(&a[2], &a[3]);
+        return;
+    }
+    if cmd == b"decide" {
+        let mut maxq: i64 = 5000;
+        let mut workers: i64 = 32;
+        let mut k = 3;
+        while k + 1 < a.len() {
+            let v = match parse_int(&a[k + 1]) { Some(v) if v > 0 => v, _ => usage() };
+            if a[k] == b"--max" { maxq = v; } else if a[k] == b"--workers" { workers = v.min(128); } else { usage(); }
+            k += 2;
+        }
+        if k != a.len() { usage(); }
+        decide::decide_main(&a[2], maxq, workers);
+        return;
+    }
     let db = store::open_map(&a[2]);
     let mut out: Vec<u8> = Vec::new();
     let mut ok = true;

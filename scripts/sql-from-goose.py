@@ -9,6 +9,8 @@ runs and none is retyped.
 
 A text bound to a name (`let LINK_CALLS_SQL = \"\"\"...\"\"\";`) keeps the name.
 Any other is named after its file and the line it starts on (GRAPH_L123).
+The one-line names (`let RULES_NUMBER = "1";`) come along too: the layout
+and rules numbers, the version, the decision model and its address.
 """
 import glob, os, re, sys
 
@@ -40,6 +42,9 @@ for path in sorted(glob.glob(os.path.join(root, 'src', '*.goose'))):
         parts.append('\n// %s:%d\npub const %s: &str = r%s"%s"%s;\n' % (
             os.path.relpath(path, root), line, name, hashes, body, hashes))
         at = b + 3
+    for m in re.finditer(r'^let ([A-Z][A-Z0-9_]*) = "([^"\\\\\n]*)";', text, re.M):
+        line = text.count('\n', 0, m.start()) + 1
+        parts.append('\n// %s:%d\npub const %s: &str = "%s";\n' % (os.path.relpath(path, root), line, m.group(1), m.group(2)))
 made = ''.join(parts)
 if '--check' in sys.argv:
     have = open(out_path, encoding='utf-8').read() if os.path.exists(out_path) else ''

@@ -158,6 +158,15 @@ pub const DECIDE_L448: &str = r#"
         DELETE FROM file_edges WHERE kind = 'call';
     "#;
 
+// src/decide.goose:25
+pub const MODEL: &str = "respan/span-02";
+
+// src/decide.goose:26
+pub const URL: &str = "https://openrouter.ai/api/v1/systemone";
+
+// src/decide.goose:27
+pub const KEY_ENV: &str = "OPENROUTER_API_KEY";
+
 // src/extract.goose:25
 pub const EXTRACT_L25: &str = r#"
 function	NAME	def $NAME($$$A): $$$B
@@ -1028,6 +1037,9 @@ pub const TOOLS: &str = r#"
 ]
 "#;
 
+// src/spread-wings.goose:30
+pub const VERSION: &str = "0.1.0";
+
 // src/store.goose:9
 pub const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -1071,6 +1083,12 @@ CREATE INDEX IF NOT EXISTS aliases_file ON aliases(file_id, dst);
 CREATE INDEX IF NOT EXISTS calls_site ON calls(file_id, row);
 CREATE INDEX IF NOT EXISTS file_edges_dst ON file_edges(dst);
 "#;
+
+// src/store.goose:67
+pub const SCHEMA_NUMBER: &str = "8";
+
+// src/store.goose:76
+pub const RULES_NUMBER: &str = "1";
 
 // src/update.goose:47
 pub const IMPORT_NAMES_SQL: &str = r#"

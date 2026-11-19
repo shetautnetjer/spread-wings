@@ -183,6 +183,8 @@ pub struct Pattern {
     nodes: Vec<i32>,
     root: i64,
     /// The pattern's own words: a file without one of them cannot match.
+    /// (goose-treesitter's `search` looks for them first; Spread-Wings
+    /// matches on a tree it already has, and does not.)
     pub words: Vec<Vec<u8>>,
 }
 
@@ -301,11 +303,6 @@ impl Pattern {
             c = solid(&self.nodes, next(&self.nodes, c));
         }
         holes > 0
-    }
-
-    /// Whether src can hold a match at all: it has every word the pattern has.
-    pub fn might_match(&self, src: &[u8]) -> bool {
-        self.words.iter().all(|w| w.is_empty() || find(src, w) >= 0)
     }
 }
 

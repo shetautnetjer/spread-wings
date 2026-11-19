@@ -8,7 +8,7 @@ use crate::util::*;
 use serde_json::Value;
 use std::io::{BufRead, Write};
 
-pub const VERSION: &str = "0.1.0";
+pub use crate::sql::VERSION;
 
 fn add(out: &mut Vec<u8>, s: &str) { out.extend_from_slice(s.as_bytes()); }
 
