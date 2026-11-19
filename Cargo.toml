@@ -2,7 +2,7 @@
 name = "spread-wings"
 version = "0.1.0"
 edition = "2021"
-description = "A broad code graph from syntax alone (the Rust trial; see docs/rust-port.md)"
+description = "A broad code graph for agents, built from syntax alone"
 license = "MIT"
 
 [[bin]]

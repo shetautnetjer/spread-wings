@@ -1,5 +1,4 @@
-// What the Goose program asks the system through native/sw_sys.c and Goose's
-// os module: files, times, folders.
+// What the program asks the system: files, times, folders.
 
 use std::fs;
 use std::os::unix::ffi::OsStrExt;

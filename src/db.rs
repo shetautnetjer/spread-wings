@@ -1,7 +1,6 @@
-// SQLite, in the shape goose-sqlite gives the Goose program: a database, a
+// SQLite through its C API (libsqlite3-sys, built in): a database, a
 // prepared statement, parameters from 1, columns from 0, text as bytes.
-// A thin layer over the C API (libsqlite3-sys), so every script and every
-// statement of the Goose program runs here as it is.
+// A thin layer, so every script in sql.rs runs as it is written.
 
 use crate::util::die;
 use libsqlite3_sys as ffi;

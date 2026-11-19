@@ -1,6 +1,32 @@
-// Compiler answers from a Swan map, and what the graph is worth against
-// one. From src/compiler.goose and src/score.goose, where the rules are set
-// out; the scripts are their own (sql.rs). Swan's map is only read.
+// Compiler answers from a Swan map. Swan's indexers (scip-python,
+// scip-typescript, rust-analyzer, ...) resolve each use of a name to the
+// definition the compiler sees. For every call site, linked or not, take
+// that answer when Swan has one at the same file and line:
+//   all uses there resolve outside the repo    -> the site keeps no link;
+//   they resolve to exactly one repo definition -> it becomes the only
+//                                                link, resolution `compiler`;
+//   they resolve to something in the repo that the graph does not hold as
+//   a definition (a parameter, a variable)     -> links into other files
+//                                                than Swan's go.
+// Anything Swan doesn't cover, or covers ambiguously, stays as the rules
+// left it, for `decide` or a reader. Swan's map is only read.
+//
+// Until 2026-11-18 only the calls tied by name were put to Swan. Measured
+// that day, most of what was wrong on a TypeScript repo was tied through an
+// imported file instead (morluto/rea: 21,389 wrong `imported_file` links of
+// 43,319 judged), and calls no rule could tie had answers waiting.
+//
+// A `compiler` link is the strongest claim this graph makes, so the map has
+// to be of this code:
+//   - the map's root must be the graph's root (else: an error);
+//   - a file changed after the map's SCIP run (or gone) is skipped, the way
+//     Swan itself calls such a file stale: its line numbers may have moved,
+//     and the match is by line;
+//   - a line with several calls of one name is taken only when the compiler
+//     answered at least as many uses there as there are calls. One answer
+//     must not speak for a second call it never saw.
+//
+// `score`, further down, reads the same map to say what the graph is worth.
 
 use crate::db::Db;
 use crate::graph::{call_file_edges, communities};
@@ -68,14 +94,14 @@ pub fn compiler_main(db_path: &[u8], swan_db: &[u8]) {
     let (db, root, scip_time) = attach_swan(db_path, swan_db);
 
     db.exec_or_die(b"BEGIN");
-    db.exec_or_die(sql::COMPILER_L96.as_bytes());
+    db.exec_or_die(sql::COMPILER_SITES_SQL.as_bytes());
 
     // Files changed since the map's SCIP run: not answered from this map.
-    let stale = stale_files(&db, &root, scip_time, sql::COMPILER_L109);
+    let stale = stale_files(&db, &root, scip_time, sql::COMPILER_STALE_SQL);
     for id in &stale { db.exec_or_die(format!("DELETE FROM sites WHERE file_id = {}", id).as_bytes()); }
     let skipped = db.scalar(b"SELECT n FROM nsites") - db.scalar(b"SELECT COUNT(*) FROM sites");
 
-    db.exec_or_die(sql::COMPILER_L116.as_bytes());
+    db.exec_or_die(sql::COMPILER_APPLY_SQL.as_bytes());
     let all = db.scalar(b"SELECT n FROM nsites");
     let covered = db.scalar(b"SELECT COUNT(*) FROM (SELECT DISTINCT file_id, row, callee FROM hits)");
     let linked = db.scalar(b"SELECT COUNT(*) FROM outcome WHERE target > 0");
@@ -106,6 +132,32 @@ pub fn compiler_main(db_path: &[u8], swan_db: &[u8]) {
         db.scalar(b"SELECT COUNT(*) FROM communities"), rounds
     );
 }
+
+// How a graph compares with Swan's map of the same code.
+//
+// Spread-Wings links by name and by path; Swan's indexers resolve each use
+// the way the compiler does (and agree with JetBrains IDEs on 99% of sampled
+// references). Put side by side, the map says what the graph's definitions
+// and links are worth, for each language, without anyone reading code:
+//
+//   links        per language of the calling file and per rule that made the
+//                link: how many links, how many Swan can judge (it resolved
+//                a use of that name on that line), and of those how many
+//                are right (Swan's definition is in the linked file), in
+//                another file of the repo, or outside the repo. A call
+//                whose name several candidates share is linked to each of
+//                them, the weight divided: so also how many calls were
+//                judged, and how many have the right link among theirs;
+//   definitions  per language and kind: the functions, methods and types
+//                Swan has, and how many the graph has at the same place;
+//   called       the same, for the definitions this repo's own call sites
+//                reach, of any kind (a constant that holds a function is a
+//                `variable` to Swan). A call whose definition the graph
+//                lacks can only be linked wrongly or not at all.
+//
+// "At the same place" is the same file, name and line. Nothing is written
+// to either database. Files changed since the map was built are left out
+// (their lines may have moved), and counted.
 
 fn json_rows(db: &Db, sql: &str, names: &[&str], texts: usize, out: &mut Vec<u8>) {
     let mut err = String::new();
@@ -144,23 +196,23 @@ pub fn score_main(db_path: &[u8], swan_db: &[u8]) {
         die("spread-wings: the Swan map's symbols have no kind and language; rebuild it with a current swan");
     }
 
-    let stale = stale_files(&db, &root, scip_time, sql::SCORE_L70);
+    let stale = stale_files(&db, &root, scip_time, sql::SCORE_STALE_SQL);
     db.exec_or_die(b"CREATE TEMP TABLE stale (file_id INTEGER PRIMARY KEY, path TEXT)");
     for id in &stale { db.exec_or_die(format!("INSERT INTO stale SELECT id, path FROM files WHERE id = {}", id).as_bytes()); }
 
-    db.exec_or_die(sql::SCORE_L77.as_bytes());
+    db.exec_or_die(sql::SCORE_JUDGE_SQL.as_bytes());
 
     let mut out: Vec<u8> = Vec::new();
     out.extend_from_slice(b"{\n  \"root\": \"");
     out.extend_from_slice(&root);
     out.extend_from_slice(format!("\",\n  \"files_changed_since_the_map\": {},\n  \"links\": ", stale.len()).as_bytes());
-    json_rows(&db, sql::SCORE_L115, &["language", "rule", "links", "judged", "right", "other_file", "outside", "calls_judged", "calls_with_the_right_link"], 2, &mut out);
+    json_rows(&db, sql::SCORE_LINKS_SQL, &["language", "rule", "links", "judged", "right", "other_file", "outside", "calls_judged", "calls_with_the_right_link"], 2, &mut out);
     out.extend_from_slice(b",\n  \"definitions\": ");
     // Swan names a constructor `<constructor>` (Java: `<init>`) and an
     // accessor `<get>size`; the graph `constructor` and `size`.
-    json_rows(&db, sql::SCORE_L128, &["language", "kind", "in_swan", "in_graph"], 2, &mut out);
+    json_rows(&db, sql::SCORE_DEFS_SQL, &["language", "kind", "in_swan", "in_graph"], 2, &mut out);
     out.extend_from_slice(b",\n  \"called\": ");
-    json_rows(&db, sql::SCORE_L142, &["language", "kind", "in_swan", "in_graph"], 2, &mut out);
+    json_rows(&db, sql::SCORE_CALLED_SQL, &["language", "kind", "in_swan", "in_graph"], 2, &mut out);
     out.extend_from_slice(b"\n}\n");
     let _ = std::io::stdout().write_all(&out);
     db.exec_or_die(b"DROP TABLE stale; DROP TABLE gdefs; DROP TABLE judged; DROP TABLE reached;");

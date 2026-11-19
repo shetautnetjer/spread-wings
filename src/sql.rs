@@ -1,8 +1,15 @@
-// Made by scripts/sql-from-goose.py from src/*.goose. Not edited by hand.
-#![allow(dead_code)]
+// The program's scripts and fixed texts: the SQL that builds and reads the
+// graph, the patterns that read each language, the usage text and the list
+// of MCP tools. Each stands with the comment written above it, and says
+// where it stood in the Goose sources the program was first written in
+// (retired 2026-11-18; their last form is commit d7a8db1).
+//
+// A change to what `index` writes for some repo (a pattern, a link script)
+// raises RULES_NUMBER in store.rs; a check in tests/test.sh holds the
+// fixtures' graphs to it.
 
-// src/compiler.goose:96
-pub const COMPILER_L96: &str = r#"
+// (was src/compiler.goose:96)
+pub const COMPILER_SITES_SQL: &str = r#"
         -- Every call site, linked or not: a line of a file and the name
         -- called there.
         CREATE TEMP TABLE sites AS
@@ -13,14 +20,14 @@ pub const COMPILER_L96: &str = r#"
         CREATE INDEX temp.sites_at ON sites (file_id, row, callee);
     "#;
 
-// src/compiler.goose:109
-pub const COMPILER_L109: &str = r#"
+// (was src/compiler.goose:109)
+pub const COMPILER_STALE_SQL: &str = r#"
         SELECT f.id, f.path, COALESCE((SELECT x.edited_mtime FROM sw.files x WHERE x.file = f.path), -1)
         FROM files f WHERE f.id IN (SELECT DISTINCT file_id FROM sites)
     "#;
 
-// src/compiler.goose:116
-pub const COMPILER_L116: &str = r#"
+// (was src/compiler.goose:116)
+pub const COMPILER_APPLY_SQL: &str = r#"
         -- The graph's definitions by file path and name, to find the one a
         -- Swan definition is. Swan counts lines from 0, Spread-Wings from 1.
         CREATE TEMP TABLE gsym AS
@@ -100,8 +107,9 @@ pub const COMPILER_L116: &str = r#"
         DELETE FROM file_edges WHERE kind = 'call';
     "#;
 
-// src/decide.goose:101
-pub const DECIDE_L101: &str = r#"
+// (was src/decide.goose:101)
+// Each still-ambiguous call site, grouped by the function it sits in.
+pub const DECIDE_SITES_SQL: &str = r#"
         SELECT DISTINCT c.file_id, c.row, c.callee, COALESCE(c.text, c.callee), c.in_symbol, f.path,
                COALESCE(s.row, 0), COALESCE(s.end_row, 0)
         FROM calls c JOIN files f ON f.id = c.file_id
@@ -111,16 +119,16 @@ pub const DECIDE_L101: &str = r#"
         ORDER BY c.file_id, c.in_symbol, c.row, c.callee
         "#;
 
-// src/decide.goose:110
-pub const DECIDE_L110: &str = r#"
+// (was src/decide.goose:110)
+pub const DECIDE_CANDIDATES_SQL: &str = r#"
         SELECT DISTINCT t.id, t.name, COALESCE(t.container, ''), tf.path, COALESCE(t.sig, '')
         FROM call_edges e JOIN symbols t ON t.id = e.callee JOIN files tf ON tf.id = t.file_id
         WHERE e.file_id = ?1 AND e.row = ?2 AND t.name = ?3 AND e.resolution = 'by_name'
         ORDER BY t.id
         "#;
 
-// src/decide.goose:136
-pub const DECIDE_L136: &str = r#"
+// (was src/decide.goose:136)
+pub const DECIDE_ROWS_SQL: &str = r#"
         SELECT DISTINCT c.row FROM calls c
         WHERE c.file_id = ?1 AND c.in_symbol = ?2 AND c.row >= ?3
           AND EXISTS (SELECT 1 FROM call_edges e JOIN symbols t ON t.id = e.callee
@@ -128,8 +136,8 @@ pub const DECIDE_L136: &str = r#"
         ORDER BY c.row
         "#;
 
-// src/decide.goose:435
-pub const DECIDE_L435: &str = r#"
+// (was src/decide.goose:435)
+pub const DECIDE_DROP_SQL: &str = r#"
         DELETE FROM decisions WHERE target > 0 AND NOT EXISTS (
             SELECT 1 FROM call_edges e WHERE e.file_id = decisions.file_id AND e.row = decisions.row
               AND e.callee = decisions.target AND e.resolution = 'by_name');
@@ -142,8 +150,8 @@ pub const DECIDE_L435: &str = r#"
         DROP TABLE clash;
     "#;
 
-// src/decide.goose:448
-pub const DECIDE_L448: &str = r#"
+// (was src/decide.goose:448)
+pub const DECIDE_APPLY_SQL: &str = r#"
         -- Sure about one definition: it becomes the only link, weight p.
         DELETE FROM call_edges WHERE resolution = 'by_name' AND rowid IN (
             SELECT e.rowid FROM call_edges e JOIN symbols t ON t.id = e.callee
@@ -158,17 +166,8 @@ pub const DECIDE_L448: &str = r#"
         DELETE FROM file_edges WHERE kind = 'call';
     "#;
 
-// src/decide.goose:25
-pub const MODEL: &str = "respan/span-02";
-
-// src/decide.goose:26
-pub const URL: &str = "https://openrouter.ai/api/v1/systemone";
-
-// src/decide.goose:27
-pub const KEY_ENV: &str = "OPENROUTER_API_KEY";
-
-// src/extract.goose:25
-pub const EXTRACT_L25: &str = r#"
+// (was src/extract.goose:25)
+pub const PATTERNS_PYTHON: &str = r#"
 function	NAME	def $NAME($$$A): $$$B
 function	NAME	def $NAME($$$A) -> $R: $$$B
 function	NAME	async def $NAME($$$A): $$$B
@@ -187,15 +186,16 @@ bind	X	for $X in $I: $$$B
 bind	X	with $E as $X: $$$B
 "#;
 
-// src/extract.goose:48
-pub const EXTRACT_L48: &str = r#"
+// (was src/extract.goose:48)
+pub const PATTERNS_RUST: &str = r#"
 import	P	use $P;
 import	P	pub use $P;
 call	F	$F($$$A)
 "#;
 
-// src/extract.goose:55
-pub const EXTRACT_L55: &str = r#"
+// (was src/extract.goose:55)
+// javascript, typescript, tsx
+pub const PATTERNS_JS: &str = r#"
 import	M	require($M)
 call	F	$F($$$A)
 assign	X	const $X = $F($$$A)
@@ -204,7 +204,10 @@ bind	X	$X = $V
 bind	X	let $X = $V
 "#;
 
-// src/extract.goose:358
+// (was src/extract.goose:358)
+// What the records of a file need once they are all written. Each
+// statement looks only within one file, so `update` runs them for the
+// files it read again (temp.u_changed) and index for every file.
 pub const SETTLE_SQL: &str = r#"
     -- Two patterns can match one definition (a const arrow and a call can
     -- overlap): keep one row per place.
@@ -249,7 +252,16 @@ pub const SETTLE_SQL: &str = r#"
         /*only: AND file_id IN (SELECT id FROM temp.u_changed) */;
 "#;
 
-// src/graph.goose:86
+// (was src/graph.goose:86)
+// A Python module below a folder that is a place imports start from: the
+// path ends in /<module path>, and the folder holding the module's first
+// segment has no __init__.py (if it had one, the module's real name would
+// start with that folder's). So `import mypkg.core` finds
+// python/mypkg/core.py, and does not find a/b/mypkg/core.py when a/b is a
+// package. pysuf holds every such ending of every Python path, so one
+// import is one indexed lookup; the shortest path wins, and of two as short
+// the one the walk met first (`ord`: a file's row number says that only in
+// a graph no update has added files to).
 pub const PKG_SUFFIX_SQL: &str = r#"
     CREATE TEMP TABLE pysuf (suffix TEXT, id INTEGER, len INTEGER, ord INTEGER);
     WITH RECURSIVE s(id, path, rest) AS (
@@ -263,8 +275,12 @@ pub const PKG_SUFFIX_SQL: &str = r#"
     CREATE INDEX pysuf_suffix ON pysuf(suffix, len, ord, id);
 "#;
 
-// src/graph.goose:221
-pub const GRAPH_L221: &str = r#"
+// (was src/graph.goose:221)
+// The imports to tie are listed first, then read from the list: the
+// loop below writes each one's file into the row it came from, and a
+// row found through an index on what is being written (which is how
+// the imports of a few files are found) can come round a second time.
+pub const IMPORTS_TODO_SQL: &str = r#"
         DROP TABLE IF EXISTS temp.imp_todo;
         CREATE TEMP TABLE imp_todo AS
             SELECT i.file_id, f.path, f.lang, i.module, i.rowid AS r, COALESCE(i.names, '') AS names
@@ -273,8 +289,8 @@ pub const GRAPH_L221: &str = r#"
             ORDER BY i.rowid;
     "#;
 
-// src/graph.goose:330
-pub const GRAPH_L330: &str = r#"
+// (was src/graph.goose:330)
+pub const ROOTS_SQL: &str = r#"
         DROP TABLE IF EXISTS temp.roots;
         CREATE TEMP TABLE roots AS
             SELECT DISTINCT substr(path, 1, instr(path || '/', '/') - 1) AS seg FROM files
@@ -288,7 +304,7 @@ pub const GRAPH_L330: &str = r#"
             UNION SELECT 'crate' UNION SELECT 'self' UNION SELECT 'super' UNION SELECT '';
     "#;
 
-// src/graph.goose:359
+// (was src/graph.goose:359)
 pub const LINK_CALLS_SQL: &str = r#"
         CREATE TEMP TABLE defs AS
             SELECT s.id AS sid, s.file_id AS sfile, s.name AS name FROM symbols s
@@ -756,8 +772,8 @@ pub const LINK_CALLS_SQL: &str = r#"
         DROP TABLE pend; DROP TABLE prov; DROP TABLE roots; DROP TABLE ext; DROP TABLE asg; DROP TABLE extvar; DROP TABLE retdef;
 "#;
 
-// src/graph.goose:832
-pub const GRAPH_L832: &str = r#"
+// (was src/graph.goose:832)
+pub const CALL_FILE_EDGES_SQL: &str = r#"
         /*dirty: DELETE FROM file_edges WHERE kind = 'call' AND src IN (SELECT id FROM temp.dirty_files); */
         -- File links from calls count for less than an import: weight 0.3,
         -- and by_name links only for names defined in at most 3 files, so
@@ -775,8 +791,11 @@ pub const GRAPH_L832: &str = r#"
             GROUP BY e.file_id, s.file_id;
     "#;
 
-// src/graph.goose:956
-pub const GRAPH_L956: &str = r#"
+// (was src/graph.goose:956)
+// Tests are grouped with the code they exercise, not with each other:
+// communities come from the code files alone, and each test file then
+// joins the community it links to most.
+pub const GROUPS_START_SQL: &str = r#"
         UPDATE files SET is_test = 1 WHERE
             path LIKE 'tests/%' OR path LIKE 'test/%' OR path LIKE '%/tests/%' OR path LIKE '%/test/%'
             OR path LIKE '%/__tests__/%' OR path LIKE '__tests__/%'
@@ -795,8 +814,8 @@ pub const GRAPH_L956: &str = r#"
             GROUP BY oa.ord, ob.ord;
     "#;
 
-// src/graph.goose:1005
-pub const GRAPH_L1005: &str = r#"
+// (was src/graph.goose:1005)
+pub const GROUPS_NEXT_LEVEL_SQL: &str = r#"
             CREATE TEMP TABLE g2 AS
                 SELECT ma.c AS a, mb.c AS b, SUM(g.w) AS w
                 FROM temp.g g JOIN temp.map ma ON ma.node = g.a JOIN temp.map mb ON mb.node = g.b
@@ -805,8 +824,11 @@ pub const GRAPH_L1005: &str = r#"
             ALTER TABLE temp.g2 RENAME TO g;
         "#;
 
-// src/graph.goose:1027
-pub const GRAPH_L1027: &str = r#"
+// (was src/graph.goose:1027)
+// Each test file joins the code community it links to most (imports
+// and calls, either way); a test linked to no code shares one community
+// of unlinked tests.
+pub const TEST_VOTES_SQL: &str = r#"
         CREATE TEMP TABLE test_votes AS
             SELECT t.id AS tid, c.community AS cm, SUM(e.w ORDER BY e.w) AS w FROM (
                 SELECT src AS a, dst AS b, weight AS w FROM file_edges
@@ -820,8 +842,10 @@ pub const GRAPH_L1027: &str = r#"
         DROP TABLE test_votes;
     "#;
 
-// src/graph.goose:1043
-pub const GRAPH_L1043: &str = r#"
+// (was src/graph.goose:1043)
+// Number the communities by their code files (unlinked tests last) and
+// name each after its most linked code file.
+pub const GROUPS_NUMBER_SQL: &str = r#"
         DELETE FROM communities;
         CREATE TEMP TABLE ranked_c AS
             SELECT community AS old,
@@ -841,14 +865,14 @@ pub const GRAPH_L1043: &str = r#"
         DROP TABLE temp.ford;
     "#;
 
-// src/score.goose:70
-pub const SCORE_L70: &str = r#"
+// (was src/score.goose:70)
+pub const SCORE_STALE_SQL: &str = r#"
         SELECT f.id, f.path, COALESCE((SELECT x.edited_mtime FROM sw.files x WHERE x.file = f.path), -1)
         FROM files f
     "#;
 
-// src/score.goose:77
-pub const SCORE_L77: &str = r#"
+// (was src/score.goose:77)
+pub const SCORE_JUDGE_SQL: &str = r#"
         -- Swan counts lines from 0, Spread-Wings from 1.
         CREATE TEMP TABLE gdefs AS
             SELECT f.path AS path, w.name AS name, w.row - 1 AS line FROM symbols w JOIN files f ON f.id = w.file_id;
@@ -884,8 +908,8 @@ pub const SCORE_L77: &str = r#"
               AND s.def_file NOT IN (SELECT path FROM stale);
     "#;
 
-// src/score.goose:115
-pub const SCORE_L115: &str = r#"
+// (was src/score.goose:115)
+pub const SCORE_LINKS_SQL: &str = r#"
         SELECT cf.lang, e.resolution, COUNT(*), COUNT(j.eid), COALESCE(SUM(j.good), 0),
                COALESCE(SUM(j.good = 0 AND j.inside = 1), 0), COALESCE(SUM(j.inside = 0), 0),
                COUNT(DISTINCT CASE WHEN j.eid IS NOT NULL THEN e.file_id || ':' || e.row || ':' || d.name END),
@@ -896,8 +920,10 @@ pub const SCORE_L115: &str = r#"
         GROUP BY cf.lang, e.resolution ORDER BY cf.lang, COUNT(*) DESC, e.resolution
     "#;
 
-// src/score.goose:128
-pub const SCORE_L128: &str = r#"
+// (was src/score.goose:128)
+// Swan names a constructor `<constructor>` (Java: `<init>`) and an
+// accessor `<get>size`; the graph `constructor` and `size`.
+pub const SCORE_DEFS_SQL: &str = r#"
         SELECT s.language, s.kind, COUNT(*),
                SUM(EXISTS (SELECT 1 FROM gdefs g WHERE g.path = s.def_file AND g.line = s.def_line
                            AND g.name = CASE WHEN s.name IN ('<constructor>', '<init>') THEN 'constructor'
@@ -911,16 +937,16 @@ pub const SCORE_L128: &str = r#"
         GROUP BY s.language, s.kind ORDER BY s.language, COUNT(*) DESC, s.kind
     "#;
 
-// src/score.goose:142
-pub const SCORE_L142: &str = r#"
+// (was src/score.goose:142)
+pub const SCORE_CALLED_SQL: &str = r#"
         SELECT r.language, r.kind, COUNT(*),
                SUM(EXISTS (SELECT 1 FROM gdefs g WHERE g.path = r.def_file AND g.name = r.name AND g.line = r.def_line))
         FROM reached r WHERE r.language <> 'swan-syntax'
         GROUP BY r.language, r.kind ORDER BY r.language, COUNT(*) DESC, r.kind
     "#;
 
-// src/spread-wings.goose:50
-pub const SPREAD_WINGS_L50: &str = r#"
+// (was src/spread-wings.goose:50)
+pub const USAGE: &str = r#"
 spread-wings 0.1.0: a broad code graph from syntax alone
 
   spread-wings index <repo> <graph.db> [--resolution N]   (Louvain resolution, default 1.5)
@@ -943,8 +969,12 @@ spread-wings 0.1.0: a broad code graph from syntax alone
                                             (OPENROUTER_API_KEY in the environment; default 5000 questions, 32 parallel requests)
 "#;
 
-// src/spread-wings.goose:349
-pub const SPREAD_WINGS_L349: &str = r#"
+// (was src/spread-wings.goose:349)
+// The files most linked to within and across communities. (Sums
+// smallest first, here and below, so that two files as much linked
+// come out in the same order whatever order the rows were written
+// in: a graph `update` has touched is not in index's row order.)
+pub const MAIN_FILES_SQL: &str = r#"
             SELECT f.path FROM files f
             LEFT JOIN (SELECT dst AS id, SUM(weight ORDER BY weight) AS w FROM file_edges GROUP BY dst) i ON i.id = f.id
             LEFT JOIN (SELECT src AS id, SUM(weight ORDER BY weight) AS w FROM file_edges GROUP BY src) o ON o.id = f.id
@@ -952,8 +982,8 @@ pub const SPREAD_WINGS_L349: &str = r#"
             ORDER BY f.is_test, COALESCE(i.w, 0) + COALESCE(o.w, 0) DESC, f.path LIMIT 5
             "#;
 
-// src/spread-wings.goose:357
-pub const SPREAD_WINGS_L357: &str = r#"
+// (was src/spread-wings.goose:357)
+pub const MOST_CALLED_SQL: &str = r#"
             SELECT s.name FROM symbols s JOIN files f ON f.id = s.file_id
             JOIN call_edges e ON e.callee = s.id
             WHERE f.community = ?1
@@ -961,8 +991,8 @@ pub const SPREAD_WINGS_L357: &str = r#"
             GROUP BY s.name ORDER BY COUNT(DISTINCT e.file_id) DESC, SUM(e.weight ORDER BY e.weight) DESC, s.name LIMIT 5
             "#;
 
-// src/spread-wings.goose:372
-pub const SPREAD_WINGS_L372: &str = r#"
+// (was src/spread-wings.goose:372)
+pub const FIND_SQL: &str = r#"
         SELECT s.name, s.kind, f.path, s.row, f.community,
                (SELECT COUNT(*) FROM calls c WHERE c.callee = s.name) AS uses
         FROM symbols s JOIN files f ON f.id = s.file_id
@@ -970,8 +1000,8 @@ pub const SPREAD_WINGS_L372: &str = r#"
         ORDER BY s.name != ?1, s.name, f.path LIMIT 50
         "#;
 
-// src/spread-wings.goose:439
-pub const SPREAD_WINGS_L439: &str = r#"
+// (was src/spread-wings.goose:439)
+pub const CALLERS_SQL: &str = r#"
         SELECT f.path, c.row, COALESCE(s.name, ''),
                COALESCE((SELECT group_concat(DISTINCT e.resolution) FROM call_edges e
                          WHERE e.file_id = c.file_id AND e.row = c.row
@@ -984,15 +1014,15 @@ pub const SPREAD_WINGS_L439: &str = r#"
         WHERE c.callee = ?1 ORDER BY f.path, c.row LIMIT 500
         "#;
 
-// src/spread-wings.goose:487
-pub const SPREAD_WINGS_L487: &str = r#"
+// (was src/spread-wings.goose:487)
+pub const TOUCH_DEFS_SQL: &str = r#"
         CREATE TEMP TABLE t_defs AS
             SELECT s.id, s.file_id, s.row, s.kind FROM symbols s JOIN files f ON f.id = s.file_id
             WHERE s.name = ?1 AND (?2 = '' OR f.path = ?2)
         "#;
 
-// src/spread-wings.goose:500
-pub const SPREAD_WINGS_L500: &str = r#"
+// (was src/spread-wings.goose:500)
+pub const TOUCH_FILES_SQL: &str = r#"
         CREATE TEMP TABLE t_touch AS
             SELECT file_id, MAX(d) AS defines, SUM(c) AS sites, SUM(g) AS guessed, MAX(i) AS imports FROM (
                 SELECT file_id, 1 AS d, 0 AS c, 0 AS g, 0 AS i FROM t_defs
@@ -1006,27 +1036,27 @@ pub const SPREAD_WINGS_L500: &str = r#"
             GROUP BY file_id;
     "#;
 
-// src/spread-wings.goose:516
-pub const SPREAD_WINGS_L516: &str = r#"
+// (was src/spread-wings.goose:516)
+pub const TOUCH_DEFS_LIST_SQL: &str = r#"
         SELECT f.path, d.row, d.kind, COALESCE(f.community, 0) FROM t_defs d JOIN files f ON f.id = d.file_id
         ORDER BY f.path, d.row
         "#;
 
-// src/spread-wings.goose:537
-pub const SPREAD_WINGS_L537: &str = r#"
+// (was src/spread-wings.goose:537)
+pub const TOUCH_FILES_LIST_SQL: &str = r#"
         SELECT f.path, t.defines, t.sites, t.guessed, t.imports, COALESCE(f.is_test, 0), COALESCE(f.community, 0)
         FROM t_touch t JOIN files f ON f.id = t.file_id
         ORDER BY t.defines DESC, f.is_test, t.sites DESC, f.path LIMIT 400
         "#;
 
-// src/spread-wings.goose:568
-pub const SPREAD_WINGS_L568: &str = r#"
+// (was src/spread-wings.goose:568)
+pub const TOUCH_GROUPS_SQL: &str = r#"
         SELECT COALESCE(f.community, 0), COALESCE(c.label, ''), COUNT(*)
         FROM t_touch t JOIN files f ON f.id = t.file_id LEFT JOIN communities c ON c.id = f.community
         GROUP BY f.community ORDER BY COUNT(*) DESC
         "#;
 
-// src/spread-wings.goose:600
+// (was src/spread-wings.goose:600)
 pub const TOOLS: &str = r#"
 [
 {"name":"overview","description":"The repo's communities (groups of files that import and call each other), each with its main files and most-called definitions. Start here to understand an unfamiliar codebase. Links are matched by name or path from syntax, not compiler-resolved.","inputSchema":{"type":"object","properties":{}}},
@@ -1037,10 +1067,7 @@ pub const TOOLS: &str = r#"
 ]
 "#;
 
-// src/spread-wings.goose:30
-pub const VERSION: &str = "0.1.0";
-
-// src/store.goose:9
+// (was src/store.goose:9)
 pub const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -1084,13 +1111,9 @@ CREATE INDEX IF NOT EXISTS calls_site ON calls(file_id, row);
 CREATE INDEX IF NOT EXISTS file_edges_dst ON file_edges(dst);
 "#;
 
-// src/store.goose:67
-pub const SCHEMA_NUMBER: &str = "8";
-
-// src/store.goose:76
-pub const RULES_NUMBER: &str = "1";
-
-// src/update.goose:47
+// (was src/update.goose:47)
+// The names on the import lines in temp.u_lines, into temp.u_names: `f`,
+// both sides of `orig>bound`, the x of `@x`.
 pub const IMPORT_NAMES_SQL: &str = r#"
     WITH RECURSIVE sp(tok, rest) AS (
         SELECT '', names || ',' FROM temp.u_lines
@@ -1102,7 +1125,10 @@ pub const IMPORT_NAMES_SQL: &str = r#"
     DELETE FROM temp.u_lines;
 "#;
 
-// src/update.goose:61
+// (was src/update.goose:61)
+// What the files in temp.u_set (read again, or gone) held, kept before
+// their rows go: each definition as other files' calls can tell it (name,
+// kind, the type it belongs to, its signature line), and each import line.
 pub const KEEP_OLD_SQL: &str = r#"
     CREATE TEMP TABLE u_old_sym AS
         SELECT id, file_id, name, kind, COALESCE(container, '') AS container, COALESCE(sig, '') AS sig, start
@@ -1116,19 +1142,32 @@ pub const KEEP_OLD_SQL: &str = r#"
     INSERT OR IGNORE INTO temp.u_reach SELECT src FROM file_edges WHERE dst IN (SELECT id FROM temp.u_set);
 "#;
 
-// src/update.goose:77
+// (was src/update.goose:77)
+// What the change reaches: the files, not changed themselves, that import
+// or call into a file that changed, was added or is gone, before the
+// change or now. Where to look next, and the tests among them to run.
 pub const REACH_SQL: &str = r#"
     INSERT OR IGNORE INTO temp.u_reach SELECT src FROM file_edges WHERE dst IN (SELECT id FROM temp.u_set);
     DELETE FROM temp.u_reach WHERE id IN (SELECT id FROM temp.u_set) OR id NOT IN (SELECT id FROM files);
 "#;
 
-// src/update.goose:84
+// (was src/update.goose:84)
+// The files something imports from, or names as a module (temp.u_dsts):
+// taken before the change and again after the imports are tied.
 pub const IMPORTED_FILES_SQL: &str = r#"
     INSERT OR IGNORE INTO temp.u_dsts SELECT DISTINCT dst FROM imports WHERE dst > 0;
     INSERT OR IGNORE INTO temp.u_dsts SELECT DISTINCT dst FROM aliases WHERE dst > 0;
 "#;
 
-// src/update.goose:97
+// (was src/update.goose:97)
+// After the files read again have their new rows: the names whose
+// definitions in them are not what they were (temp.u_chg, by file). A name
+// defined in at most 50 places, before or now, can be tied from anywhere,
+// and goes to temp.u_names: every call of it is tied again. A name defined
+// in more than 50 places before and now is only ever tied to the
+// definitions in the caller's own file and in the files it imports
+// (LINK_CALLS_SQL), so a change to it in a file reaches the calls of it in
+// the files that import that file and no others (temp.u_near).
 pub const COMPARE_SQL: &str = r#"
     CREATE TEMP TABLE u_new_sym AS
         SELECT id, file_id, name, kind, COALESCE(container, '') AS container, COALESCE(sig, '') AS sig, start
@@ -1160,7 +1199,13 @@ pub const COMPARE_SQL: &str = r#"
         SELECT g.file_id, g.name FROM temp.u_chg g JOIN temp.u_cnt c ON c.name = g.name WHERE c.now > 50 AND c.was > 50;
 "#;
 
-// src/update.goose:134
+// (was src/update.goose:134)
+// After their imports are tied: the import lines a file read again gained
+// or lost. One that names a file of the repo, in a file that something
+// imports from, passes names on, and the names on it go to temp.u_lines
+// (an import from outside the repo passes nothing on, nor does a file
+// nothing imports from). And in a file whose import lines are not what
+// they were, the functions that say what they return.
 pub const COMPARE_IMPORTS_SQL: &str = r#"
     CREATE TEMP TABLE u_new_imp AS
         SELECT file_id, COALESCE(module, '') AS module, COALESCE(names, '') AS names, COALESCE(dst, 0) AS dst
@@ -1182,7 +1227,11 @@ pub const COMPARE_IMPORTS_SQL: &str = r#"
           AND file_id IN (SELECT file_id FROM temp.u_lost UNION SELECT file_id FROM temp.u_gained);
 "#;
 
-// src/update.goose:159
+// (was src/update.goose:159)
+// The links of every name whose definitions are as they were (not in
+// temp.u_all), moved from a definition's old row to its new one. Definitions alike in name, kind, type and
+// signature line are the same to any call from outside the file, so the
+// old ones are paired with the new ones in the order they stand in it.
 pub const MOVE_LINKS_SQL: &str = r#"
     CREATE TEMP TABLE u_all (name TEXT PRIMARY KEY) WITHOUT ROWID;
     INSERT OR IGNORE INTO temp.u_all SELECT name FROM temp.u_names;
@@ -1202,7 +1251,9 @@ pub const MOVE_LINKS_SQL: &str = r#"
         WHERE callee IN (SELECT old FROM temp.u_map);
 "#;
 
-// src/update.goose:180
+// (was src/update.goose:180)
+// Every row of the files in temp.u_set (read again, or gone), and the files
+// in temp.u_gone themselves.
 pub const DROP_ROWS_SQL: &str = r#"
     DELETE FROM symbols WHERE file_id IN (SELECT id FROM temp.u_set);
     DELETE FROM imports WHERE file_id IN (SELECT id FROM temp.u_set);
@@ -1217,7 +1268,10 @@ pub const DROP_ROWS_SQL: &str = r#"
     DELETE FROM files WHERE id IN (SELECT id FROM temp.u_gone);
 "#;
 
-// src/update.goose:197
+// (was src/update.goose:197)
+// After every import was tied again (a file was added or removed): the
+// files not read again whose imports, or names for whole modules, now land
+// somewhere else than before (temp.u_imp, temp.u_ali).
 pub const REIMPORTED_SQL: &str = r#"
     INSERT OR IGNORE INTO temp.u_reimp
         SELECT b.file_id FROM temp.u_imp b JOIN imports i ON i.rowid = b.r WHERE COALESCE(i.dst, 0) <> b.dst;
@@ -1234,7 +1288,13 @@ pub const REIMPORTED_SQL: &str = r#"
           AND name IS NOT NULL AND instr(COALESCE(sig, ''), '->') > 0;
 "#;
 
-// src/update.goose:219
+// (was src/update.goose:219)
+// The calls to tie again (temp.dirty), by the list at the top of update.rs,
+// the files they are in (temp.dirty_files), and their links and notes taken
+// away. temp.u_names holds the names every call of which is redone,
+// temp.u_near those redone in the files that import the changed file,
+// temp.u_all every name whose definitions or passing on changed, and
+// temp.u_files the files whose every call is redone.
 pub const DIRTY_SQL: &str = r#"
     INSERT OR IGNORE INTO temp.u_files SELECT id FROM temp.u_changed;
     -- What a variable bound from a call holds is read off the called
@@ -1276,7 +1336,11 @@ pub const DIRTY_SQL: &str = r#"
     UPDATE calls SET note = NULL WHERE note IS NOT NULL AND rowid IN (SELECT cid FROM temp.dirty);
 "#;
 
-// src/update.goose:264
+// (was src/update.goose:264)
+// How many of the file links update redid (those out of the files read
+// again, and the call links out of the files with calls tied again) are not
+// what they were (temp.u_fe): 0 when the same links, with the same weights,
+// are back.
 pub const FILE_LINKS_SAME_SQL: &str = r#"
     SELECT (SELECT COUNT(*) FROM (
                 SELECT src, dst, kind, weight, COUNT(*) FROM temp.u_fe GROUP BY 1, 2, 3, 4
@@ -1294,8 +1358,8 @@ pub const FILE_LINKS_SAME_SQL: &str = r#"
                 SELECT src, dst, kind, weight, COUNT(*) FROM temp.u_fe GROUP BY 1, 2, 3, 4))
 "#;
 
-// src/update.goose:317
-pub const UPDATE_L317: &str = r#"
+// (was src/update.goose:317)
+pub const UPDATE_TEMP_SQL: &str = r#"
         CREATE TEMP TABLE u_walk (ord INTEGER PRIMARY KEY, path TEXT UNIQUE, lang TEXT, size INTEGER, mtime INTEGER, ctime INTEGER);
         CREATE TEMP TABLE u_changed (id INTEGER PRIMARY KEY);
         CREATE TEMP TABLE u_added (id INTEGER PRIMARY KEY);
@@ -1309,36 +1373,37 @@ pub const UPDATE_L317: &str = r#"
         CREATE TEMP TABLE dirty_files (id INTEGER PRIMARY KEY);
     "#;
 
-// src/update.goose:357
-pub const UPDATE_L357: &str = r#"
+// (was src/update.goose:357)
+pub const UPDATE_WALK_SQL: &str = r#"
         SELECT w.ord, f.id, s.hash IS NOT NULL, COALESCE(s.hash, 0),
                s.file_id IS NULL OR s.mtime = 0 OR s.size IS NOT w.size OR s.mtime IS NOT w.mtime OR s.ctime IS NOT w.ctime
         FROM temp.u_walk w JOIN files f ON f.path = w.path LEFT JOIN stamps s ON s.file_id = f.id
         ORDER BY w.ord
     "#;
 
-// src/update.goose:434
-pub const UPDATE_L434: &str = r#"
+// (was src/update.goose:434)
+pub const KEEP_IMPORTS_SQL: &str = r#"
             CREATE TEMP TABLE u_imp AS SELECT rowid AS r, file_id, COALESCE(dst, 0) AS dst FROM imports
                 WHERE file_id NOT IN (SELECT id FROM temp.u_set);
             CREATE TEMP TABLE u_ali AS SELECT file_id, alias, dst FROM aliases
                 WHERE file_id NOT IN (SELECT id FROM temp.u_set);
         "#;
 
-// src/update.goose:455
-pub const UPDATE_L455: &str = r#"
+// (was src/update.goose:455)
+// Every file's place in the walk: a file added or removed moves the rest.
+pub const RENUMBER_WALK_SQL: &str = r#"
             UPDATE stamps SET ord = (SELECT w.ord FROM temp.u_walk w JOIN files f ON f.path = w.path
                                      WHERE f.id = stamps.file_id);
         "#;
 
-// src/update.goose:491
-pub const UPDATE_L491: &str = r#"
+// (was src/update.goose:491)
+pub const KEEP_CALL_LINKS_SQL: &str = r#"
             INSERT INTO temp.u_fe SELECT src, dst, kind, weight FROM file_edges
                 WHERE kind = 'call' AND src IN (SELECT id FROM temp.dirty_files) AND src NOT IN (SELECT id FROM temp.u_set);
         "#;
 
-// src/update.goose:523
-pub const UPDATE_L523: &str = r#"
+// (was src/update.goose:523)
+pub const REACHED_TESTS_SQL: &str = r#"
         SELECT path FROM files WHERE is_test = 1
           AND (id IN (SELECT id FROM temp.u_reach) OR id IN (SELECT id FROM temp.u_changed))
         ORDER BY path LIMIT 200

@@ -1,7 +1,41 @@
-// `update`: the graph `index` would build now, reached from the one that is
-// there, by reading only the files that changed and tying again only the
-// calls they reach. From src/update.goose, where the reasoning is set out
-// beside each script; the scripts are its own (sql.rs).
+// One-file updates: `spread-wings update <repo> <graph.db>` brings a graph
+// up to date with its repo by reading again only the files that changed and
+// tying again only the calls a change can reach. The graph it leaves is the
+// one `index` builds from the same files, apart from row numbers
+// (tests/graph_dump.py prints a graph without them; the two are compared).
+//
+// What a call's links hang on, and so what makes update tie it again:
+//   - its own file: its definitions, imports and variables. The file was
+//     read again; or its imports now land on other files (a file was added
+//     or removed); or a variable in it is bound from a call of a name whose
+//     definitions changed, one of which says what it returns (what x holds
+//     after `x = build()` decides the calls on x, and is read off
+//     `def build() -> Graph`);
+//   - the definitions of the name it calls, anywhere: how many there are,
+//     which files hold them, which type each belongs to, what each says it
+//     returns. A file read again changes a name when the definitions of
+//     that name in it are not what they were (by kind, type and signature
+//     line): the body of a function can change and its callers stay as
+//     they are, their links moved to the definition's new row. A name
+//     defined in more than 50 places is tied only within the caller's own
+//     file and the files it imports, so a change to one reaches only the
+//     files that import the changed file;
+//   - the names files pass on (`from .base import f`): a name on an import
+//     line that a file read again gained, lost or changed may now come
+//     through it from elsewhere, when some file imports from that file
+//     (a file nothing imports from passes nothing on);
+//   - a name called under another (`import {f as g}`: `g()` when f changed);
+//   - what a function returns, as far as its file's imports say (`-> Graph`
+//     is an outside type while the file imports Graph from outside): when
+//     a file's imports change, the names of its functions that say what
+//     they return;
+//   - the far end of a link: one to a definition that is gone is redone;
+//   - the repo's top-level names (make_roots): when a file added or removed
+//     changes them, every call is tied again.
+// A link is kept by line, so every call on a line is tied again with any
+// one of them.
+//
+// The scripts, each with what it is for, are in sql.rs.
 
 use crate::db::Db;
 use crate::extract::*;
@@ -44,7 +78,7 @@ pub fn update_graph(db: &Db, repo: &[u8], gamma: f64, regroup: bool, out: &mut V
     let mut ctimes: Vec<i64> = Vec::new();
     stat_files(&all_paths, n, &mut sizes, &mut mtimes, &mut ctimes);
 
-    db.exec_or_die(sql::UPDATE_L317.as_bytes());
+    db.exec_or_die(sql::UPDATE_TEMP_SQL.as_bytes());
     {
         let ins_walk = db.prepare_or_die(b"INSERT INTO temp.u_walk (ord, path, lang, size, mtime, ctime) VALUES (?1, ?2, ?3, ?4, ?5, ?6)");
         for i in 0..n {
@@ -69,7 +103,7 @@ pub fn update_graph(db: &Db, repo: &[u8], gamma: f64, regroup: bool, out: &mut V
     let mut which: Vec<usize> = Vec::new();
     let mut err = String::new();
     {
-        let q = db.prepare_or_die(sql::UPDATE_L357.as_bytes());
+        let q = db.prepare_or_die(sql::UPDATE_WALK_SQL.as_bytes());
         while q.step(&mut err) == 1 {
             let i = q.col_int(0) as usize;
             pids[i] = q.col_int(1);
@@ -134,7 +168,7 @@ pub fn update_graph(db: &Db, repo: &[u8], gamma: f64, regroup: bool, out: &mut V
     db.exec_or_die(b"INSERT INTO temp.u_set SELECT id FROM temp.u_changed UNION SELECT id FROM temp.u_gone");
     db.exec_or_die(sql::KEEP_OLD_SQL.as_bytes());
     db.exec_or_die(sql::IMPORTED_FILES_SQL.as_bytes());
-    if set_changed { db.exec_or_die(sql::UPDATE_L434.as_bytes()); }
+    if set_changed { db.exec_or_die(sql::KEEP_IMPORTS_SQL.as_bytes()); }
     // A definition's new row never takes the number of a row just removed
     // (a row with the highest number holds the place meanwhile): a link
     // that still carries a removed row's number then names no row at all,
@@ -149,7 +183,7 @@ pub fn update_graph(db: &Db, repo: &[u8], gamma: f64, regroup: bool, out: &mut V
     settle_facts(db, true);
     if set_changed {
         // Every file's place in the walk: a file added or removed moves the rest.
-        db.exec_or_die(sql::UPDATE_L455.as_bytes());
+        db.exec_or_die(sql::RENUMBER_WALK_SQL.as_bytes());
     }
     let t1 = Instant::now();
 
@@ -181,7 +215,7 @@ pub fn update_graph(db: &Db, repo: &[u8], gamma: f64, regroup: bool, out: &mut V
         db.exec_or_die(b"DELETE FROM call_edges; DELETE FROM file_edges WHERE kind = 'call'; UPDATE calls SET note = NULL WHERE note IS NOT NULL;");
         link_calls(db, false);
     } else {
-        db.exec_or_die(sql::UPDATE_L491.as_bytes());
+        db.exec_or_die(sql::KEEP_CALL_LINKS_SQL.as_bytes());
         link_calls(db, true);
         // The groups come from the files and the links between them. With
         // the same files and every link between them as it was (the usual
@@ -215,7 +249,7 @@ pub fn update_graph(db: &Db, repo: &[u8], gamma: f64, regroup: bool, out: &mut V
     ));
     json_texts(db, "SELECT path FROM files WHERE id IN (SELECT id FROM temp.u_reach) ORDER BY path LIMIT 200", out);
     add(out, ",\"tests\":");
-    json_texts(db, sql::UPDATE_L523, out);
+    json_texts(db, sql::REACHED_TESTS_SQL, out);
     add(out, &format!(",\"read_ms\":{},\"link_ms\":{}", (t1 - t0).as_millis(), (t2 - t1).as_millis()));
     true
 }

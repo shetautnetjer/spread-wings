@@ -23,19 +23,19 @@ together: Spread-Wings to find the area, Swan to answer inside it.
 1. **Walk** the repo, skipping hidden folders and dependency/build folders
    (`node_modules`, `target`, `dist`, `build`, virtualenvs, caches).
    Symlinked folders are not entered.
-2. **Extract** (`src/extract.goose`). For each language, a short list of
-   goose-treesitter patterns (`def $NAME($$$A) -> $R: $$$B`,
+2. **Extract** (`src/extract.rs`). For each language, a short list of
+   ast-grep style patterns (`def $NAME($$$A) -> $R: $$$B`,
    `pub fn $NAME($$$A) { $$$B }`, `$F($$$A)`, ...). Files go to a pool of
-   Goose worker threads, one per hardware thread, pulling from one queue, so
+   worker threads, one per hardware thread, pulling from one queue, so
    a big file doesn't hold the others up. A worker parses its file once and
-   matches every pattern against that tree (`search_loaded`), instead of
+   matches every pattern against that tree, instead of
    parsing it again per pattern; this halved to thirded parse time. Results
    come back to the main thread, which writes them in file order, so the
    graph is identical every run. Each match becomes a fact: a definition (name, kind, line, byte
    span), an import (module text) or a call site (callee name). ES `import`
    and `export ... from` lines are read from the text, since a pattern can't
    hold the module string.
-3. **Resolve** (`src/graph.goose`):
+3. **Resolve** (`src/graph.rs`):
    - Imports to files by path rules per language. Rust also handles `mod x;`,
      `crate::`, `self::`, `super::` and workspace crates by name (`foo_bar`
      is a `foo-bar/src/lib.rs`).
@@ -61,7 +61,7 @@ together: Spread-Wings to find the area, Swan to answer inside it.
 5. **Communities.** Louvain clustering over the **code files only**: local
    moving to the best modularity gain (resolution γ, 1.5 by default), then
    each community becomes one node, until nothing moves. It runs on flat CSR
-   arrays in Goose; SQLite merges the levels. Deterministic. Test files are
+   arrays in memory; SQLite merges the levels. Deterministic. Test files are
    then attached, each to the code community it links to most; tests linked
    to no code share one community. On a test-heavy repo (Graphify: 118 code
    files, 571 test files) clustering everything together made each community
@@ -70,7 +70,7 @@ together: Spread-Wings to find the area, Swan to answer inside it.
    install, watch, LLM). γ = 1 left 3 large groups there, γ = 2 started
    merging unrelated files; 1.5 was the clearest.
 6. **Serve.** CLI and MCP tools read the SQLite file.
-7. **Update** (`src/update.goose`), in place of 1 to 5 once a graph is
+7. **Update** (`src/update.rs`), in place of 1 to 5 once a graph is
    there. See below.
 
 Label propagation was tried first and dropped: one hub file imported
@@ -153,7 +153,7 @@ The watcher opens the graph for each update and closes it after, so a
 reader always finds the last finished state, and `compiler --into` can copy
 it at any time. It ends with the process that started it.
 
-`RULES_NUMBER` (`src/store.goose`) numbers what `index` writes for a repo.
+`RULES_NUMBER` (`src/store.rs`) numbers what `index` writes for a repo.
 A graph written under another number is built whole: half of it under old
 rules and half under new would be neither.
 

@@ -1,7 +1,8 @@
 # Spread-Wings
 
-A broad code graph for agents, built from syntax alone, in
-[Goose](https://github.com/aardappel/goose).
+A broad code graph for agents, built from syntax alone. Written in Rust; it
+began in [Goose](https://github.com/aardappel/goose) and was carried over
+with the same graph and the same checks ([docs/rust-port.md](docs/rust-port.md)).
 
 Point it at any repository and it maps the whole thing in about a second:
 which files belong together, what each one defines, what imports and calls
@@ -16,8 +17,8 @@ rebuilt to be fast, local and honest about what it knows.
 
 ## Why
 
-- **Fast.** Goose compiles to C. Spread-Wings starts instantly and parses on
-  every core, so re-indexing after every change is cheap:
+- **Fast.** One native program of 8 MB. It starts in about two milliseconds
+  and parses on every core, so re-indexing after every change is cheap:
 
   | Repository | Files | Definitions | Call sites | Parse | Link + communities |
   |---|---|---|---|---|---|
@@ -52,8 +53,8 @@ rebuilt to be fast, local and honest about what it knows.
 ## What it builds
 
 - **Files, definitions, imports and call sites**, from
-  [goose-treesitter](https://github.com/shetautnetjer/goose-treesitter)
-  parses on every core. TypeScript, TSX, JavaScript and Rust definitions
+  [tree-sitter](https://tree-sitter.github.io/tree-sitter/) parses on every
+  core. TypeScript, TSX, JavaScript and Rust definitions
   are read from the syntax tree by the kind of each node (a method, a
   constant holding a function, a `pub(crate) const fn` are definitions
   however they are spelled); Python's, and every language's imports and
@@ -81,8 +82,7 @@ rebuilt to be fast, local and honest about what it knows.
   each joins the community of the code it uses most. Each community is named
   after its most linked code file and lists its code files, test files, main
   files and most-called definitions.
-- Stored in one SQLite file through
-  [goose-sqlite](https://github.com/shetautnetjer/goose-sqlite).
+- Stored in one SQLite file (SQLite is built into the program).
 
 ## Keeping it up to date
 
@@ -140,7 +140,7 @@ against them. The agreed order of work is in Swan's `docs/wings-and-swan.md`.
 ## Use
 
 ```bash
-scripts/build.sh                      # needs the Goose compiler (GOOSE=/path/to/goose)
+scripts/build.sh                      # needs cargo (Rust) and libcurl's development files
 bin/spread-wings index ~/code/myrepo myrepo.db              # --resolution 2 for smaller communities
 bin/spread-wings update ~/code/myrepo myrepo.db             # after edits: the same graph, from the files that changed
 bin/spread-wings watch ~/code/myrepo myrepo.db              # stay awake: update on every change, one line each
@@ -167,12 +167,13 @@ All output is JSON.
 
 ## Known limits (0.1)
 
-- Goose is read by line, not from a syntax tree (goose-treesitter has no
-  Goose grammar): definitions, `import .x;` and bare calls. A call into a
+- Goose is read by line, not from a syntax tree (there is no tree-sitter
+  grammar for Goose): definitions, `import .x;` and bare calls. A call into a
   file the caller does not import itself is matched by name, though Goose
   programs share one namespace across their imports.
-- Five languages. Goose-treesitter parses more (Java, Kotlin, C/C++, C#,
-  PHP, Lua, GDScript, shaders); their patterns come next.
+- Five languages. tree-sitter has grammars for more (Java, Kotlin, C/C++,
+  C#, PHP, Lua, GDScript, shaders); each needs its grammar crate and its
+  patterns.
 - Python definitions, and all imports and calls, are matched as fixed
   shapes, so unusual ones can be missed (for example a Python function
   inside a decorator factory's return).

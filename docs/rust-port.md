@@ -4,6 +4,19 @@ Started 2026-11-18 15:48 PST on the owner's word ("Go rust"), on the branch
 `rust`. The Goose program in `src/` stays as it is and stays the one that
 ships until this is decided. The Rust program is in `rust/`.
 
+## Outcome (2026-11-18, 18:22 PST)
+
+The owner chose Rust, on the numbers below and for his own reasons (it is
+easier to build on, and to carry other tools' ideas into). The trial was
+merged as it stood (`d7a8db1`), and the change after it made the Rust
+program the one that is built and retired the Goose one. So from that
+change on: `rust/` in this document is the repository itself (`Cargo.toml`,
+`src/*.rs`); `scripts/sql-from-goose.py` and its check are gone, their work
+done (the scripts live in `src/sql.rs`, each under a name that says what it
+is, with the comment that stood above it); and the Goose sources as they
+last were are at commit `d7a8db1`. The rest of this page is the record of
+the trial, left as it was written.
+
 ## Why
 
 The owner's question: would this have been better in Rust, with Goose for
